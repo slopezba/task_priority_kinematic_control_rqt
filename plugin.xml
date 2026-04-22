@@ -1,0 +1,13 @@
+<library path="task_priority_kinematic_control_rqt.task_priority_panel">
+  <class
+    name="TaskPriorityPanel"
+    type="task_priority_kinematic_control_rqt.task_priority_panel.TaskPriorityPanel"
+    base_class_type="rqt_gui_py::Plugin">
+    <description>Task Priority controller panel.</description>
+    <qtgui>
+      <label>Task Priority Control</label>
+      <icon type="theme">preferences-system</icon>
+      <statustip>Manage task-priority tasks and solver parameters.</statustip>
+    </qtgui>
+  </class>
+</library>
