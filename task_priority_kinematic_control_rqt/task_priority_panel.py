@@ -29,6 +29,8 @@ from task_priority_kinematic_control.srv import (
     SetTaskEnabled,
 )
 
+TASK_TOPIC_PREFIX = "/cirtesub/controller/task_priority/tasks"
+
 
 class TaskPriorityPanel(Plugin):
     def __init__(self, context):
@@ -257,7 +259,7 @@ class TaskPriorityPanel(Plugin):
                 self._show_error("XYZ must have 3 values and quaternion must have 4 values")
                 return
 
-            topic_name = f"/task_priority_controller/tasks/{task_id}/target"
+            topic_name = f"{TASK_TOPIC_PREFIX}/{task_id}/target"
             if task_id not in self._pose_goal_pubs:
                 self._pose_goal_pubs[task_id] = self._node.create_publisher(
                     PoseStamped, topic_name, 10
@@ -289,7 +291,7 @@ class TaskPriorityPanel(Plugin):
                 )
                 return
 
-            topic_name = f"/task_priority_controller/tasks/{task_id}/joint_target"
+            topic_name = f"{TASK_TOPIC_PREFIX}/{task_id}/joint_target"
             if task_id not in self._joint_target_pubs:
                 self._joint_target_pubs[task_id] = self._node.create_publisher(
                     Float64MultiArray, topic_name, 10
