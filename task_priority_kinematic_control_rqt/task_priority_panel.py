@@ -1,8 +1,11 @@
 import functools
 
 from geometry_msgs.msg import PoseStamped
-from python_qt_binding.QtCore import Qt
+from python_qt_binding.QtCore import QMimeData, QPoint, Qt, Signal
+from python_qt_binding.QtGui import QDrag
 from python_qt_binding.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QFormLayout,
@@ -32,6 +35,80 @@ from task_priority_kinematic_control.srv import (
 TASK_TOPIC_PREFIX = "/cirtesub/controller/task_priority/tasks"
 
 
+class TaskTableWidget(QTableWidget):
+    row_dropped = Signal(int, int)
+
+    def __init__(self, rows, columns):
+        super().__init__(rows, columns)
+        self._drag_start_row = -1
+        self._drag_start_pos = QPoint()
+        self.setDragEnabled(False)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropOverwriteMode(False)
+        self.setDragDropMode(QAbstractItemView.DragDrop)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_start_pos = event.pos()
+            self._drag_start_row = self.indexAt(event.pos()).row()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not event.buttons() & Qt.LeftButton:
+            return
+        if self._drag_start_row < 0:
+            return
+        if (
+            event.pos() - self._drag_start_pos
+        ).manhattanLength() < QApplication.startDragDistance():
+            return
+
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        mime_data.setText(str(self._drag_start_row))
+        drag.setMimeData(mime_data)
+        drag.exec_(Qt.MoveAction)
+        self._drag_start_row = -1
+
+    def dragEnterEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.source() is self:
+            event.acceptProposedAction()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        source_row = self._drag_start_row
+        target_row = self.indexAt(event.pos()).row()
+        if target_row < 0:
+            target_row = self.rowCount() - 1
+
+        self._drag_start_row = -1
+        if (
+            source_row < 0
+            or target_row < 0
+            or source_row >= self.rowCount()
+            or target_row >= self.rowCount()
+        ):
+            event.ignore()
+            return
+
+        event.acceptProposedAction()
+        if source_row != target_row:
+            self.row_dropped.emit(source_row, target_row)
+
+
 class TaskPriorityPanel(Plugin):
     def __init__(self, context):
         super().__init__(context)
@@ -51,25 +128,25 @@ class TaskPriorityPanel(Plugin):
         self._status_label.setAlignment(Qt.AlignLeft)
         self._layout.addWidget(self._status_label)
 
-        self._table = QTableWidget(0, 6)
+        self._table = TaskTableWidget(0, 6)
         self._table.setHorizontalHeaderLabels(
             ["Task", "Plugin", "Group", "Priority", "Enabled", "Status"]
         )
+        self._table.row_dropped.connect(self._apply_order_from_table_move)
+        self._table.itemSelectionChanged.connect(self._update_priority_buttons)
         self._layout.addWidget(self._table)
 
+        table_buttons = QHBoxLayout()
         self._refresh_button = QPushButton("Refresh")
-        self._refresh_button.clicked.connect(self._refresh_tasks)
-        self._layout.addWidget(self._refresh_button)
-
-        reorder_box = QGroupBox("Reorder Tasks")
-        reorder_layout = QHBoxLayout(reorder_box)
-        self._reorder_edit = QLineEdit()
-        self._reorder_edit.setPlaceholderText("left_pose,right_pose,joint_limits,...")
-        self._reorder_button = QPushButton("Apply Order")
-        self._reorder_button.clicked.connect(self._apply_order)
-        reorder_layout.addWidget(self._reorder_edit)
-        reorder_layout.addWidget(self._reorder_button)
-        self._layout.addWidget(reorder_box)
+        self._refresh_button.clicked.connect(lambda: self._refresh_tasks())
+        self._move_up_button = QPushButton("Up")
+        self._move_up_button.clicked.connect(functools.partial(self._move_selected_task, -1))
+        self._move_down_button = QPushButton("Down")
+        self._move_down_button.clicked.connect(functools.partial(self._move_selected_task, 1))
+        table_buttons.addWidget(self._refresh_button)
+        table_buttons.addWidget(self._move_up_button)
+        table_buttons.addWidget(self._move_down_button)
+        self._layout.addLayout(table_buttons)
 
         goal_box = QGroupBox("Pose Goal")
         goal_layout = QFormLayout(goal_box)
@@ -106,6 +183,7 @@ class TaskPriorityPanel(Plugin):
         self._pose_goal_pubs = {}
         self._joint_target_pubs = {}
         self._targetable_tasks = {}
+        self._last_ordered_task_ids = []
         self._state_sub = self._node.create_subscription(
             HierarchyState, "/hierarchy_state", self._on_hierarchy_state, 10
         )
@@ -130,7 +208,7 @@ class TaskPriorityPanel(Plugin):
             f"Backend: {msg.backend_name} | Solver: {msg.solver_method} | Ready: {msg.ready}"
         )
 
-    def _refresh_tasks(self):
+    def _refresh_tasks(self, selected_task_id=None):
         if not self._list_client.wait_for_service(timeout_sec=0.2):
             self._show_error("list_tasks service is not available")
             return
@@ -140,10 +218,17 @@ class TaskPriorityPanel(Plugin):
             self._show_error("Failed to list tasks")
             return
 
+        if selected_task_id is None:
+            selected_task_id = self._selected_task_id()
+
         self._table.setRowCount(len(response.tasks))
         targetable_tasks = {}
+        self._last_ordered_task_ids = []
         for row, task in enumerate(response.tasks):
-            self._table.setItem(row, 0, QTableWidgetItem(task.id))
+            self._last_ordered_task_ids.append(task.id)
+            task_item = QTableWidgetItem(task.id)
+            task_item.setData(Qt.UserRole, task.id)
+            self._table.setItem(row, 0, task_item)
             self._table.setItem(row, 1, QTableWidgetItem(task.plugin))
             self._table.setItem(row, 2, QTableWidgetItem(task.group))
             self._table.setItem(row, 3, QTableWidgetItem(str(task.priority)))
@@ -156,6 +241,9 @@ class TaskPriorityPanel(Plugin):
             self._table.setItem(row, 5, QTableWidgetItem(task.status_message))
             if task.enabled and task.target_type in ("pose", "joint_array"):
                 targetable_tasks[task.id] = task
+
+        self._select_task_row(selected_task_id)
+        self._update_priority_buttons()
 
         previous_task_id = self._goal_task_combo.currentData()
         self._targetable_tasks = targetable_tasks
@@ -174,6 +262,77 @@ class TaskPriorityPanel(Plugin):
 
         self._on_goal_task_changed()
 
+    def _selected_task_id(self):
+        current_row = self._table.currentRow()
+        if current_row < 0:
+            return None
+        item = self._table.item(current_row, 0)
+        if item is None:
+            return None
+        return item.data(Qt.UserRole)
+
+    def _select_task_row(self, task_id):
+        if task_id is None:
+            return
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item is not None and item.data(Qt.UserRole) == task_id:
+                self._table.selectRow(row)
+                return
+
+    def _update_priority_buttons(self):
+        current_row = self._table.currentRow()
+        self._move_up_button.setEnabled(current_row > 0)
+        self._move_down_button.setEnabled(
+            current_row >= 0 and current_row < self._table.rowCount() - 1
+        )
+
+    def _move_selected_task(self, offset):
+        source_row = self._table.currentRow()
+        target_row = source_row + offset
+        if source_row < 0 or target_row < 0 or target_row >= len(self._last_ordered_task_ids):
+            return
+        self._apply_order_from_table_move(source_row, target_row)
+
+    def _apply_order_from_table_move(self, source_row, target_row):
+        if source_row == target_row:
+            return
+
+        if (
+            source_row < 0
+            or target_row < 0
+            or source_row >= len(self._last_ordered_task_ids)
+            or target_row >= len(self._last_ordered_task_ids)
+        ):
+            self._refresh_tasks()
+            return
+
+        ordered_ids = list(self._last_ordered_task_ids)
+        task_id = ordered_ids.pop(source_row)
+        ordered_ids.insert(target_row, task_id)
+
+        self._apply_order(ordered_ids, task_id)
+
+    def _apply_order(self, ordered_ids, selected_task_id):
+        if ordered_ids == self._last_ordered_task_ids:
+            return
+
+        if not self._reorder_client.wait_for_service(timeout_sec=0.2):
+            self._show_error("reorder_tasks service is not available")
+            self._refresh_tasks(selected_task_id)
+            return
+
+        req = ReorderTasks.Request()
+        req.ordered_task_ids = ordered_ids
+        response = self._spin_until_complete(self._reorder_client.call_async(req))
+        if response is None or not response.success:
+            self._show_error(response.message if response else "Failed to reorder tasks")
+            self._refresh_tasks(selected_task_id)
+            return
+
+        self._last_ordered_task_ids = ordered_ids
+        self._refresh_tasks(selected_task_id)
+
     def _toggle_task(self, task_id, state):
         if not self._enable_client.wait_for_service(timeout_sec=0.2):
             self._show_error("set_task_enabled service is not available")
@@ -184,22 +343,6 @@ class TaskPriorityPanel(Plugin):
         response = self._spin_until_complete(self._enable_client.call_async(req))
         if response is None or not response.success:
             self._show_error(response.message if response else "Failed to update task state")
-            return
-        self._refresh_tasks()
-
-    def _apply_order(self):
-        ordered_ids = [item.strip() for item in self._reorder_edit.text().split(",") if item.strip()]
-        if not ordered_ids:
-            self._show_error("Please provide at least one task id")
-            return
-        if not self._reorder_client.wait_for_service(timeout_sec=0.2):
-            self._show_error("reorder_tasks service is not available")
-            return
-        req = ReorderTasks.Request()
-        req.ordered_task_ids = ordered_ids
-        response = self._spin_until_complete(self._reorder_client.call_async(req))
-        if response is None or not response.success:
-            self._show_error(response.message if response else "Failed to reorder tasks")
             return
         self._refresh_tasks()
 
