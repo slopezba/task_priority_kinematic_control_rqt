@@ -15,6 +15,7 @@
   <depend>rqt_gui</depend>
   <depend>rqt_gui_py</depend>
   <depend>geometry_msgs</depend>
+  <depend>std_srvs</depend>
   <depend>task_priority_kinematic_control</depend>
 
   <export>

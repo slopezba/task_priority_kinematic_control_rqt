@@ -7,6 +7,7 @@ ROS 2 RQT plugin for monitoring and interacting with the task-priority kinematic
 - Task state table
 - Enable and disable task controls
 - Task reordering controls
+- Runtime solver method, `dls_lambda`, and `dof_weights` tuning through ROS parameters
 - Runtime target publication for supported tasks
 
 ## Dependencies
