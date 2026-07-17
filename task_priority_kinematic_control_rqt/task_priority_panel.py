@@ -1,6 +1,8 @@
 import functools
+import os
 import time
 
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from python_qt_binding.QtCore import QMimeData, QPoint, Qt, QTimer, Signal
 from python_qt_binding.QtGui import QDrag
@@ -30,9 +32,11 @@ from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters
 from rqt_gui_py.plugin import Plugin
 import rclpy
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
+from sura_manipulation_actions.action import PlanJointTrajectory
 
 from task_priority_kinematic_control.msg import ControllerOutput, HierarchyState, TaskGainUpdate, TaskState
 from task_priority_kinematic_control.srv import (
@@ -46,6 +50,10 @@ from task_priority_kinematic_control.srv import (
 TASK_TOPIC_PREFIX = "/cirtesub/controller/task_priority/tasks"
 CONTROLLER_OUTPUT_TOPIC = "/cirtesub/controller/task_priority/output"
 DEFAULT_CONTROLLER_NODE = "/cirtesub/controller/task_priority_controller"
+DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION = "/cirtesub/manipulation/plan_joint_trajectory"
+DEFAULT_EXECUTE_PENDING_TRAJECTORY_SERVICE = (
+    "/plan_joint_trajectory_lifecycle_action_server/execute_pending_trajectory"
+)
 LAMBDA_SCALE = 10000
 LAMBDA_MIN = 0.0001
 LAMBDA_MAX = 1.0
@@ -56,6 +64,10 @@ DOF_WEIGHT_MAX = 20.0
 JOINT_TARGET_SCALE = 1000
 DEFAULT_JOINT_MIN = 0.0
 DEFAULT_JOINT_MAX = 6.1
+DEFAULT_PREDEFINED_POSES = {
+    "alpha_left": ["unfold", "grab_zip", "look_down", "extend", "fold", "home"],
+    "alpha_right": ["unfold", "grab_zip", "look_down", "extend", "fold", "home"],
+}
 
 
 class TaskTableWidget(QTableWidget):
@@ -154,6 +166,8 @@ class TaskPriorityPanel(Plugin):
         self._gain_entries = {}
         self._dof_weight_entries = []
         self._joint_target_controls = []
+        self._predefined_poses_by_arm = dict(DEFAULT_PREDEFINED_POSES)
+        self._plan_joint_goal_handle = None
 
         self._widget = QWidget()
         self._widget.setWindowTitle("Task Priority Control")
@@ -195,6 +209,7 @@ class TaskPriorityPanel(Plugin):
         self._tabs.addTab(self._build_gains_tab(), "Gains")
         self._tabs.addTab(self._build_goal_tab(), "Pose Goal")
         self._tabs.addTab(self._build_errors_tab(), "Errors")
+        self._tabs.addTab(self._build_predefined_poses_tab(), "Predefined Poses")
         self._layout.addWidget(self._tabs)
 
         context.add_widget(self._widget)
@@ -205,6 +220,12 @@ class TaskPriorityPanel(Plugin):
         self._set_task_gains_client = self._node.create_client(SetTaskGains, "/set_task_gains")
         self._reorder_client = self._node.create_client(ReorderTasks, "/reorder_tasks")
         self._stop_client = self._node.create_client(Trigger, "/stop_task_priority")
+        self._plan_joint_action_client = ActionClient(
+            self._node,
+            PlanJointTrajectory,
+            DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION,
+        )
+        self._plan_joint_action_name_cached = DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION
         self._state_sub = self._node.create_subscription(
             HierarchyState, "/hierarchy_state", self._on_hierarchy_state, 10
         )
@@ -349,6 +370,66 @@ class TaskPriorityPanel(Plugin):
         layout.addWidget(self._controller_output_table)
         return tab
 
+    def _build_predefined_poses_tab(self):
+        tab = QWidget()
+        layout = QFormLayout(tab)
+
+        self._predefined_poses_by_arm = self._load_predefined_pose_names()
+        self._plan_joint_action_edit = QLineEdit(DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION)
+        self._plan_joint_arm_combo = QComboBox()
+        self._plan_joint_arm_combo.addItem("left", "left")
+        self._plan_joint_arm_combo.addItem("right", "right")
+        self._plan_joint_arm_combo.currentIndexChanged.connect(self._update_predefined_pose_combo)
+
+        self._predefined_pose_combo = QComboBox()
+        self._predefined_pose_combo.setEditable(True)
+        self._plan_joint_execute_checkbox = QCheckBox("Execute after planning")
+        self._plan_joint_execute_checkbox.setChecked(True)
+        self._execute_pending_service_edit = QLineEdit(DEFAULT_EXECUTE_PENDING_TRAJECTORY_SERVICE)
+
+        self._plan_joint_positions_edit = QLineEdit("0.0,0.0,0.0,0.0,0.0")
+        self._plan_joint_planning_time_spin = QDoubleSpinBox()
+        self._plan_joint_planning_time_spin.setRange(0.0, 120.0)
+        self._plan_joint_planning_time_spin.setDecimals(2)
+        self._plan_joint_planning_time_spin.setSingleStep(0.5)
+        self._plan_joint_planning_time_spin.setValue(0.0)
+        self._plan_joint_goal_tolerance_spin = QDoubleSpinBox()
+        self._plan_joint_goal_tolerance_spin.setRange(0.0, 1.0)
+        self._plan_joint_goal_tolerance_spin.setDecimals(4)
+        self._plan_joint_goal_tolerance_spin.setSingleStep(0.005)
+        self._plan_joint_goal_tolerance_spin.setValue(0.0)
+
+        buttons = QHBoxLayout()
+        self._send_predefined_pose_button = QPushButton("Send Goal")
+        self._send_predefined_pose_button.clicked.connect(self._send_predefined_pose_goal)
+        self._execute_pending_button = QPushButton("Execute Pending")
+        self._execute_pending_button.clicked.connect(self._execute_pending_trajectory)
+        self._cancel_predefined_pose_button = QPushButton("Cancel Goal")
+        self._cancel_predefined_pose_button.clicked.connect(self._cancel_predefined_pose_goal)
+        buttons.addWidget(self._send_predefined_pose_button)
+        buttons.addWidget(self._execute_pending_button)
+        buttons.addWidget(self._cancel_predefined_pose_button)
+        buttons.addStretch(1)
+
+        self._plan_joint_feedback_label = QLabel("No goal sent")
+        self._plan_joint_feedback_label.setWordWrap(True)
+        self._plan_joint_result_label = QLabel("")
+        self._plan_joint_result_label.setWordWrap(True)
+
+        layout.addRow("Action", self._plan_joint_action_edit)
+        layout.addRow("Arm", self._plan_joint_arm_combo)
+        layout.addRow("Predefined Pose", self._predefined_pose_combo)
+        layout.addRow("Execute", self._plan_joint_execute_checkbox)
+        layout.addRow("Execute Service", self._execute_pending_service_edit)
+        layout.addRow("Joint Positions", self._plan_joint_positions_edit)
+        layout.addRow("Planning Time", self._plan_joint_planning_time_spin)
+        layout.addRow("Goal Tolerance", self._plan_joint_goal_tolerance_spin)
+        layout.addRow(buttons)
+        layout.addRow("Feedback", self._plan_joint_feedback_label)
+        layout.addRow("Result", self._plan_joint_result_label)
+        self._update_predefined_pose_combo()
+        return tab
+
     def shutdown_plugin(self):
         self._spin_timer.stop()
         self._node.destroy_node()
@@ -387,6 +468,79 @@ class TaskPriorityPanel(Plugin):
         if not values:
             return "[]"
         return "[" + " ".join(self._format_float(value) for value in values) + "]"
+
+    def _load_predefined_pose_names(self):
+        pose_names = {arm: list(names) for arm, names in DEFAULT_PREDEFINED_POSES.items()}
+        try:
+            import yaml
+
+            share_dir = get_package_share_directory("sura_manipulation_actions")
+            poses_file = os.path.join(share_dir, "config", "predefined_poses.yaml")
+            with open(poses_file, "r", encoding="utf-8") as file:
+                root = yaml.safe_load(file) or {}
+        except Exception:
+            return pose_names
+
+        poses_root = root.get("predefined_poses", {})
+        if not isinstance(poses_root, dict):
+            return pose_names
+
+        loaded_names = {}
+        for arm_name, poses in poses_root.items():
+            if isinstance(poses, dict):
+                loaded_names[str(arm_name)] = [str(name) for name in poses.keys()]
+        return loaded_names or pose_names
+
+    def _canonical_arm_name(self, arm_name):
+        if arm_name in ("left", "alpha_left", "cirtesub/alpha_left"):
+            return "alpha_left"
+        if arm_name in ("right", "alpha_right", "cirtesub/alpha_right"):
+            return "alpha_right"
+        return arm_name
+
+    def _plan_joint_action_name(self):
+        action_name = self._plan_joint_action_edit.text().strip()
+        return action_name or DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION
+
+    def _execute_pending_service_name(self):
+        service_name = self._execute_pending_service_edit.text().strip()
+        return service_name or DEFAULT_EXECUTE_PENDING_TRAJECTORY_SERVICE
+
+    def _ensure_plan_joint_action_client(self):
+        action_name = self._plan_joint_action_name()
+        if getattr(self, "_plan_joint_action_name_cached", None) == action_name:
+            return
+        if hasattr(self, "_plan_joint_action_client"):
+            self._plan_joint_action_client.destroy()
+        self._plan_joint_action_client = ActionClient(
+            self._node,
+            PlanJointTrajectory,
+            action_name,
+        )
+        self._plan_joint_action_name_cached = action_name
+
+    def _update_predefined_pose_combo(self):
+        if not hasattr(self, "_predefined_pose_combo"):
+            return
+
+        previous_pose = self._predefined_pose_combo.currentText().strip()
+        arm_name = self._plan_joint_arm_combo.currentData()
+        canonical_arm = self._canonical_arm_name(arm_name)
+        poses = self._predefined_poses_by_arm.get(canonical_arm, [])
+
+        self._predefined_pose_combo.blockSignals(True)
+        self._predefined_pose_combo.clear()
+        for pose_name in poses:
+            self._predefined_pose_combo.addItem(pose_name, pose_name)
+        self._predefined_pose_combo.blockSignals(False)
+
+        if previous_pose:
+            pose_index = self._predefined_pose_combo.findText(previous_pose)
+            if pose_index >= 0:
+                self._predefined_pose_combo.setCurrentIndex(pose_index)
+        elif self._predefined_pose_combo.count() > 0:
+            home_index = self._predefined_pose_combo.findText("home")
+            self._predefined_pose_combo.setCurrentIndex(home_index if home_index >= 0 else 0)
 
     def _slider_value_from_double(self, value):
         return int(round(value * JOINT_TARGET_SCALE))
@@ -1103,6 +1257,105 @@ class TaskPriorityPanel(Plugin):
             return
 
         self._show_error("Selected task does not accept runtime targets")
+
+    def _send_predefined_pose_goal(self):
+        self._ensure_plan_joint_action_client()
+        if not self._plan_joint_action_client.wait_for_server(timeout_sec=0.5):
+            self._show_error(f"Action server is not available: {self._plan_joint_action_name()}")
+            return
+
+        pose_name = self._predefined_pose_combo.currentText().strip()
+        try:
+            joint_positions = [
+                float(value.strip()) for value in self._plan_joint_positions_edit.text().split(",")
+            ]
+        except ValueError:
+            self._show_error("Joint Positions must contain comma-separated numbers")
+            return
+
+        if len(joint_positions) != 5:
+            self._show_error("Joint Positions must contain exactly 5 values")
+            return
+
+        goal_msg = PlanJointTrajectory.Goal()
+        goal_msg.arm_name = self._plan_joint_arm_combo.currentData()
+        goal_msg.predefined_pose = pose_name
+        goal_msg.joint_positions = joint_positions
+        goal_msg.planning_time = self._plan_joint_planning_time_spin.value()
+        goal_msg.goal_tolerance = self._plan_joint_goal_tolerance_spin.value()
+        goal_msg.execute = self._plan_joint_execute_checkbox.isChecked()
+
+        self._plan_joint_feedback_label.setText(
+            f"Sending {goal_msg.arm_name} / {pose_name or 'joint_positions'}..."
+        )
+        self._plan_joint_result_label.setText("")
+        send_future = self._plan_joint_action_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self._on_plan_joint_feedback,
+        )
+        send_future.add_done_callback(self._on_plan_joint_goal_response)
+
+    def _cancel_predefined_pose_goal(self):
+        if self._plan_joint_goal_handle is None:
+            self._plan_joint_feedback_label.setText("No active goal to cancel")
+            return
+        cancel_future = self._plan_joint_goal_handle.cancel_goal_async()
+        cancel_future.add_done_callback(self._on_plan_joint_cancel_response)
+
+    def _execute_pending_trajectory(self):
+        service_name = self._execute_pending_service_name()
+        client = self._node.create_client(Trigger, service_name)
+        try:
+            if not client.wait_for_service(timeout_sec=0.5):
+                self._show_error(f"Execute service is not available: {service_name}")
+                return
+
+            response = self._spin_until_complete(client.call_async(Trigger.Request()))
+            if response is None:
+                self._show_error("Timed out executing pending trajectory")
+                return
+
+            status = "success" if response.success else "failed"
+            self._plan_joint_result_label.setText(f"{status}: {response.message}")
+        finally:
+            self._node.destroy_client(client)
+
+    def _on_plan_joint_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._plan_joint_goal_handle = None
+            self._plan_joint_feedback_label.setText("Goal rejected")
+            return
+
+        self._plan_joint_goal_handle = goal_handle
+        self._plan_joint_feedback_label.setText("Goal accepted")
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_plan_joint_result)
+
+    def _on_plan_joint_feedback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        joint_error = ", ".join(self._format_float(value, 3) for value in feedback.joint_error)
+        self._plan_joint_feedback_label.setText(
+            f"{feedback.state}: {feedback.message} | "
+            f"distance {self._format_float(feedback.closest_distance, 3)} "
+            f"{feedback.closest_object} | error [{joint_error}]"
+        )
+
+    def _on_plan_joint_result(self, future):
+        self._plan_joint_goal_handle = None
+        result = future.result().result
+        status = "success" if result.success else "failed"
+        self._plan_joint_result_label.setText(
+            f"{status}: {result.message} | final error "
+            f"{self._format_float(result.final_error_norm, 4)}"
+        )
+
+    def _on_plan_joint_cancel_response(self, future):
+        response = future.result()
+        if response.goals_canceling:
+            self._plan_joint_feedback_label.setText("Cancel requested")
+        else:
+            self._plan_joint_feedback_label.setText("Goal could not be canceled")
 
     def _publish_joint_target(self, task_id, task, show_errors=True):
         joint_target = self._joint_target_values()

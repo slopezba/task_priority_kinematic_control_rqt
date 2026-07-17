@@ -11,11 +11,13 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
+  <depend>ament_index_python</depend>
   <depend>python_qt_binding</depend>
   <depend>rqt_gui</depend>
   <depend>rqt_gui_py</depend>
   <depend>geometry_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>sura_manipulation_actions</depend>
   <depend>task_priority_kinematic_control</depend>
 
   <export>
