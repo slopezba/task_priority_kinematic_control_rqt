@@ -28,8 +28,8 @@ from python_qt_binding.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from rcl_interfaces.msg import ParameterType
-from rcl_interfaces.srv import GetParameters
+from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
+from rcl_interfaces.srv import GetParameters, SetParameters
 from rqt_gui_py.plugin import Plugin
 import rclpy
 from rclpy.action import ActionClient
@@ -38,13 +38,13 @@ from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 from sura_manipulation_actions.action import PlanJointTrajectory
 
-from task_priority_kinematic_control.msg import ControllerOutput, HierarchyState, TaskGainUpdate, TaskState
+from task_priority_kinematic_control.msg import ControllerOutput, HierarchyState, TaskState
 from task_priority_kinematic_control.srv import (
     ListTasks,
     ReorderTasks,
     SetSolverConfig,
-    SetTaskGains,
     SetTaskEnabled,
+    SetTaskJointActivation,
 )
 
 TASK_TOPIC_PREFIX = "/cirtesub/controller/task_priority/tasks"
@@ -164,6 +164,7 @@ class TaskPriorityPanel(Plugin):
         self._latest_controller_output = None
         self._last_ordered_task_ids = []
         self._gain_entries = {}
+        self._gain_original_values = {}
         self._dof_weight_entries = []
         self._joint_target_controls = []
         self._predefined_poses_by_arm = dict(DEFAULT_PREDEFINED_POSES)
@@ -217,7 +218,9 @@ class TaskPriorityPanel(Plugin):
         self._list_client = self._node.create_client(ListTasks, "/list_tasks")
         self._enable_client = self._node.create_client(SetTaskEnabled, "/set_task_enabled")
         self._set_solver_config_client = self._node.create_client(SetSolverConfig, "/set_solver_config")
-        self._set_task_gains_client = self._node.create_client(SetTaskGains, "/set_task_gains")
+        self._set_task_joint_activation_client = self._node.create_client(
+            SetTaskJointActivation, "/set_task_joint_activation"
+        )
         self._reorder_client = self._node.create_client(ReorderTasks, "/reorder_tasks")
         self._stop_client = self._node.create_client(Trigger, "/stop_task_priority")
         self._plan_joint_action_client = ActionClient(
@@ -736,6 +739,7 @@ class TaskPriorityPanel(Plugin):
     def _rebuild_gain_controls(self, gain_specs):
         self._clear_layout(self._gains_layout)
         self._gain_entries = {}
+        self._gain_original_values = {}
 
         if not gain_specs:
             self._gains_empty_label = QLabel("No gain parameters loaded")
@@ -749,6 +753,7 @@ class TaskPriorityPanel(Plugin):
             grid.setHorizontalSpacing(6)
             grid.setVerticalSpacing(4)
             spinboxes = []
+            self._gain_original_values[(task_id, field)] = list(values)
             for index, value in enumerate(values):
                 label = QLabel(labels[index] if index < len(labels) else str(index))
                 label.setMaximumWidth(72)
@@ -776,30 +781,56 @@ class TaskPriorityPanel(Plugin):
         if not self._gain_entries:
             return
 
-        updates = []
+        parameters = []
+        changed_values = {}
         for (task_id, field), spinboxes in self._gain_entries.items():
-            update = TaskGainUpdate()
-            update.task_id = task_id
-            update.field = field
             values = [spin.value() for spin in spinboxes]
+            original = self._gain_original_values.get((task_id, field), [])
+            if len(values) == len(original) and all(
+                abs(value - original_value) <= 1e-9
+                for value, original_value in zip(values, original)
+            ):
+                continue
+
+            parameter = Parameter()
+            parameter.name = f"tasks.{task_id}.{field}"
+            parameter.value = ParameterValue()
             if field == "gain_scalar":
-                update.values = [values[0]]
+                parameter.value.type = ParameterType.PARAMETER_DOUBLE
+                parameter.value.double_value = values[0]
             else:
-                update.values = values
-            updates.append(update)
+                parameter.value.type = ParameterType.PARAMETER_DOUBLE_ARRAY
+                parameter.value.double_array_value = values
+            parameters.append(parameter)
+            changed_values[(task_id, field)] = values
 
-        if not self._set_task_gains_client.wait_for_service(timeout_sec=0.2):
-            self._show_error("set_task_gains service is not available")
+        if not parameters:
             return
 
-        req = SetTaskGains.Request()
-        req.updates = updates
-        response = self._spin_until_complete(self._set_task_gains_client.call_async(req))
-        if response is None:
-            self._show_error("Timed out setting task gains")
-            return
-        if not response.success:
-            self._show_error(response.message or "Controller rejected gain parameters")
+        node_name = self._controller_node_name()
+        client = self._node.create_client(SetParameters, f"{node_name}/set_parameters")
+        try:
+            if not client.wait_for_service(timeout_sec=0.2):
+                self._show_error(f"set_parameters service is not available for {node_name}")
+                return
+
+            req = SetParameters.Request()
+            req.parameters = parameters
+            response = self._spin_until_complete(client.call_async(req))
+            if response is None:
+                self._show_error("Timed out setting task gain parameters")
+                return
+
+            for index, result in enumerate(response.results):
+                if not result.successful:
+                    reason = result.reason or "Controller rejected gain parameter"
+                    self._show_error(f"{parameters[index].name}: {reason}")
+                    return
+
+            for key, values in changed_values.items():
+                self._gain_original_values[key] = list(values)
+        finally:
+            self._node.destroy_client(client)
 
     def _on_hierarchy_state(self, msg):
         self._status_label.setText(
@@ -861,7 +892,7 @@ class TaskPriorityPanel(Plugin):
             )
             self._table.setCellWidget(row, 4, checkbox)
             self._table.setItem(row, 5, QTableWidgetItem(task.status_message))
-            if task.enabled and task.target_type in ("pose", "joint_array"):
+            if task.target_type in ("pose", "joint_array"):
                 targetable_tasks[task.id] = task
 
         self._select_task_row(selected_task_id)
@@ -1002,11 +1033,46 @@ class TaskPriorityPanel(Plugin):
 
         return [0.0] * len(task.joint_names)
 
+    def _pose_goal_frame_id(self, task_id):
+        status = self._task_statuses.get(task_id)
+        if status is not None and "EndEffectorsRelativePoseTask" in status.plugin:
+            values = self._read_controller_parameters([f"tasks.{task_id}.reference_frame"])
+            if values and values[0].type == ParameterType.PARAMETER_STRING:
+                return values[0].string_value
+        values = self._read_controller_parameters(["world_frame"])
+        if values and values[0].type == ParameterType.PARAMETER_STRING:
+            return values[0].string_value
+        return "world_ned"
+
+    def _sync_pose_goal_fields(self, task_id):
+        state = self._latest_task_states.get(task_id)
+        if state is not None and len(state.target) == 7:
+            target = list(state.target)
+        else:
+            values = self._read_controller_parameters([f"tasks.{task_id}.default_relative_pose"])
+            if values and values[0].type == ParameterType.PARAMETER_DOUBLE_ARRAY:
+                target = list(values[0].double_array_value)
+            else:
+                return
+
+        if len(target) != 7:
+            return
+
+        self._goal_xyz.setText(
+            ",".join(self._format_float(value, 4) for value in target[:3])
+        )
+        self._goal_quat.setText(
+            ",".join(self._format_float(value, 4) for value in target[3:7])
+        )
+
     def _rebuild_joint_target_controls(self, task_id, task):
         self._clear_layout(self._joint_target_layout)
         self._joint_target_controls = []
         ranges = self._joint_limit_ranges_for_task(task)
         values = self._target_values_for_task(task_id, task)
+        activation = list(task.joint_activation)
+        if len(activation) != len(task.joint_names):
+            activation = [True] * len(task.joint_names)
 
         for row, joint_name in enumerate(task.joint_names):
             lower, upper = ranges.get(joint_name, (DEFAULT_JOINT_MIN, DEFAULT_JOINT_MAX))
@@ -1014,6 +1080,8 @@ class TaskPriorityPanel(Plugin):
                 lower, upper = DEFAULT_JOINT_MIN, DEFAULT_JOINT_MAX
             value = min(max(values[row], lower), upper)
 
+            active_checkbox = QCheckBox()
+            active_checkbox.setChecked(bool(activation[row]))
             name_label = QLabel(joint_name)
             slider = QSlider(Qt.Horizontal)
             slider.setRange(self._slider_value_from_double(lower), self._slider_value_from_double(upper))
@@ -1030,16 +1098,20 @@ class TaskPriorityPanel(Plugin):
             slider.valueChanged.connect(functools.partial(self._on_joint_slider_changed, row))
             slider.sliderReleased.connect(self._publish_live_joint_target)
             spin.valueChanged.connect(functools.partial(self._on_joint_spin_changed, row))
+            active_checkbox.stateChanged.connect(
+                functools.partial(self._on_joint_activation_changed, row)
+            )
 
-            self._joint_target_layout.addWidget(name_label, row, 0)
-            self._joint_target_layout.addWidget(slider, row, 1)
-            self._joint_target_layout.addWidget(spin, row, 2)
-            self._joint_target_controls.append((slider, spin))
+            self._joint_target_layout.addWidget(active_checkbox, row, 0)
+            self._joint_target_layout.addWidget(name_label, row, 1)
+            self._joint_target_layout.addWidget(slider, row, 2)
+            self._joint_target_layout.addWidget(spin, row, 3)
+            self._joint_target_controls.append((slider, spin, active_checkbox))
 
     def _on_joint_slider_changed(self, row, value):
         if row >= len(self._joint_target_controls):
             return
-        _, spin = self._joint_target_controls[row]
+        _, spin, _ = self._joint_target_controls[row]
         spin.blockSignals(True)
         spin.setValue(self._double_from_slider_value(value))
         spin.blockSignals(False)
@@ -1048,14 +1120,55 @@ class TaskPriorityPanel(Plugin):
     def _on_joint_spin_changed(self, row, value):
         if row >= len(self._joint_target_controls):
             return
-        slider, _ = self._joint_target_controls[row]
+        slider, _, _ = self._joint_target_controls[row]
         slider.blockSignals(True)
         slider.setValue(self._slider_value_from_double(value))
         slider.blockSignals(False)
         self._schedule_live_joint_target()
 
+    def _on_joint_activation_changed(self, row, state):
+        if row >= len(self._joint_target_controls):
+            return
+        self._send_joint_activation(show_errors=True)
+
     def _joint_target_values(self):
-        return [spin.value() for _, spin in self._joint_target_controls]
+        return [spin.value() for _, spin, _ in self._joint_target_controls]
+
+    def _joint_activation_values(self):
+        return [checkbox.isChecked() for _, _, checkbox in self._joint_target_controls]
+
+    def _send_joint_activation(self, show_errors=True):
+        task_id = self._goal_task_combo.currentData()
+        task = self._targetable_tasks.get(task_id)
+        if task is None or task.target_type != "joint_array":
+            return
+
+        activation = self._joint_activation_values()
+        if len(activation) != len(task.joint_names):
+            if show_errors:
+                self._show_error(
+                    f"Joint activation must contain {len(task.joint_names)} values for the selected task"
+                )
+            return
+
+        if not self._set_task_joint_activation_client.wait_for_service(timeout_sec=0.2):
+            if show_errors:
+                self._show_error("set_task_joint_activation service is not available")
+            return
+
+        req = SetTaskJointActivation.Request()
+        req.task_id = task_id
+        req.joint_activation = activation
+        response = self._spin_until_complete(
+            self._set_task_joint_activation_client.call_async(req)
+        )
+        if response is None:
+            if show_errors:
+                self._show_error("Timed out setting joint activation")
+            return
+        if not response.success and show_errors:
+            self._show_error(response.message or "Controller rejected joint activation")
+
 
     def _schedule_live_joint_target(self):
         if self._live_joint_target_checkbox.isVisible() and self._live_joint_target_checkbox.isChecked():
@@ -1191,6 +1304,7 @@ class TaskPriorityPanel(Plugin):
             self._clear_layout(self._joint_target_layout)
             self._joint_target_controls = []
             self._live_joint_target_checkbox.setVisible(False)
+            self._sync_pose_goal_fields(task_id)
             self._goal_button.setEnabled(True)
             return
 
@@ -1241,7 +1355,7 @@ class TaskPriorityPanel(Plugin):
 
             pose_msg = PoseStamped()
             pose_msg.header.stamp = self._node.get_clock().now().to_msg()
-            pose_msg.header.frame_id = "world_ned"
+            pose_msg.header.frame_id = self._pose_goal_frame_id(task_id)
             pose_msg.pose.position.x = xyz[0]
             pose_msg.pose.position.y = xyz[1]
             pose_msg.pose.position.z = xyz[2]
