@@ -1035,7 +1035,10 @@ class TaskPriorityPanel(Plugin):
 
     def _pose_goal_frame_id(self, task_id):
         status = self._task_statuses.get(task_id)
-        if status is not None and "EndEffectorsRelativePoseTask" in status.plugin:
+        if status is not None and (
+            "EndEffectorsRelativePoseTask" in status.plugin
+            or "EndEffectorPlanRelativePoseTask" in status.plugin
+        ):
             values = self._read_controller_parameters([f"tasks.{task_id}.reference_frame"])
             if values and values[0].type == ParameterType.PARAMETER_STRING:
                 return values[0].string_value
