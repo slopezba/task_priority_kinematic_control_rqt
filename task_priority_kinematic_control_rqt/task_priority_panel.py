@@ -49,7 +49,7 @@ from task_priority_kinematic_control.srv import (
 
 TASK_TOPIC_PREFIX = "/cirtesub/controller/task_priority/tasks"
 CONTROLLER_OUTPUT_TOPIC = "/cirtesub/controller/task_priority/output"
-DEFAULT_CONTROLLER_NODE = "/cirtesub/controller/task_priority_controller"
+DEFAULT_CONTROLLER_NODE = "/cirtesub/alpha/controller/task_priority_controller"
 DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION = "/cirtesub/manipulation/plan_joint_trajectory"
 DEFAULT_EXECUTE_PENDING_TRAJECTORY_SERVICE = (
     "/plan_joint_trajectory_lifecycle_action_server/execute_pending_trajectory"
@@ -390,7 +390,11 @@ class TaskPriorityPanel(Plugin):
         self._plan_joint_execute_checkbox.setChecked(True)
         self._execute_pending_service_edit = QLineEdit(DEFAULT_EXECUTE_PENDING_TRAJECTORY_SERVICE)
 
-        self._plan_joint_positions_edit = QLineEdit("0.0,0.0,0.0,0.0,0.0")
+        self._plan_joint_positions_edit = QLineEdit("0.0,0.0,0.0,0.0")
+        self._plan_joint_positions_edit.setToolTip(
+            "4 joint positions in radians: axis_b, axis_c, axis_d, axis_e. "
+            "Ignored by the planner when a predefined pose is selected."
+        )
         self._plan_joint_planning_time_spin = QDoubleSpinBox()
         self._plan_joint_planning_time_spin.setRange(0.0, 120.0)
         self._plan_joint_planning_time_spin.setDecimals(2)
@@ -1390,8 +1394,10 @@ class TaskPriorityPanel(Plugin):
             self._show_error("Joint Positions must contain comma-separated numbers")
             return
 
-        if len(joint_positions) != 5:
-            self._show_error("Joint Positions must contain exactly 5 values")
+        if len(joint_positions) != 4:
+            self._show_error(
+                "Joint Positions must contain exactly 4 values (axis_b, axis_c, axis_d, axis_e)"
+            )
             return
 
         goal_msg = PlanJointTrajectory.Goal()
