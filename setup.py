@@ -16,6 +16,7 @@ setup(
         (os.path.join("share", package_name, "resource"), glob("resource/*")),
     ],
     install_requires=["setuptools"],
+    tests_require=["pytest"],
     zip_safe=True,
     maintainer="usuario",
     maintainer_email="barajas@uji.es",

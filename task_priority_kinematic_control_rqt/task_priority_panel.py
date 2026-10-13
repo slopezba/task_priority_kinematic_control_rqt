@@ -21,7 +21,9 @@ from python_qt_binding.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -37,6 +39,9 @@ from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import Trigger
 from sura_manipulation_actions.action import PlanJointTrajectory
+
+from .bimanual_cartesian_tab import BimanualCartesianTab
+from .cartesian_tab import CartesianTab
 
 from task_priority_kinematic_control.msg import ControllerOutput, HierarchyState, TaskState
 from task_priority_kinematic_control.srv import (
@@ -182,13 +187,20 @@ class TaskPriorityPanel(Plugin):
         self._status_label.setAlignment(Qt.AlignLeft)
         self._layout.addWidget(self._status_label)
 
+        self._vertical_splitter = QSplitter(Qt.Vertical)
+        self._vertical_splitter.setChildrenCollapsible(False)
+        self._vertical_splitter.setToolTip("Drag vertically to resize the task table and tabs")
+        hierarchy_widget = QWidget()
+        hierarchy_layout = QVBoxLayout(hierarchy_widget)
+        hierarchy_layout.setContentsMargins(0, 0, 0, 0)
         self._table = TaskTableWidget(0, 6)
+        self._table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         self._table.setHorizontalHeaderLabels(
             ["Task", "Plugin", "Group", "Priority", "Enabled", "Status"]
         )
         self._table.row_dropped.connect(self._apply_order_from_table_move)
         self._table.itemSelectionChanged.connect(self._update_priority_buttons)
-        self._layout.addWidget(self._table)
+        hierarchy_layout.addWidget(self._table, 1)
 
         table_buttons = QHBoxLayout()
         self._refresh_button = QPushButton("Refresh")
@@ -203,15 +215,24 @@ class TaskPriorityPanel(Plugin):
         table_buttons.addWidget(self._move_up_button)
         table_buttons.addWidget(self._move_down_button)
         table_buttons.addWidget(self._stop_button)
-        self._layout.addLayout(table_buttons)
+        hierarchy_layout.addLayout(table_buttons)
+        self._vertical_splitter.addWidget(hierarchy_widget)
 
         self._tabs = QTabWidget()
-        self._tabs.addTab(self._build_solver_tab(), "Solver")
-        self._tabs.addTab(self._build_gains_tab(), "Gains")
-        self._tabs.addTab(self._build_goal_tab(), "Pose Goal")
-        self._tabs.addTab(self._build_errors_tab(), "Errors")
-        self._tabs.addTab(self._build_predefined_poses_tab(), "Predefined Poses")
-        self._layout.addWidget(self._tabs)
+        self._add_scrollable_tab(self._build_solver_tab(), "Solver")
+        self._add_scrollable_tab(self._build_gains_tab(), "Gains")
+        self._add_scrollable_tab(self._build_goal_tab(), "Pose Goal")
+        self._add_scrollable_tab(self._build_errors_tab(), "Errors")
+        self._add_scrollable_tab(self._build_predefined_poses_tab(), "Predefined Poses")
+        self._cartesian_tab = CartesianTab(self._node)
+        self._add_scrollable_tab(self._cartesian_tab, "Cartesian")
+        self._bimanual_cartesian_tab = BimanualCartesianTab(self._node)
+        self._add_scrollable_tab(self._bimanual_cartesian_tab, "Bimanual Cartesian")
+        self._vertical_splitter.addWidget(self._tabs)
+        self._vertical_splitter.setStretchFactor(0, 1)
+        self._vertical_splitter.setStretchFactor(1, 2)
+        self._vertical_splitter.setSizes([220, 440])
+        self._layout.addWidget(self._vertical_splitter, 1)
 
         context.add_widget(self._widget)
 
@@ -242,6 +263,15 @@ class TaskPriorityPanel(Plugin):
         self._refresh_tasks()
         self._read_solver_parameters(show_errors=False)
         self._read_gain_parameters(show_errors=False)
+
+    def _add_scrollable_tab(self, content, title):
+        # Keep long forms from imposing their minimum height on the whole panel.
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        scroll.setMinimumHeight(0)
+        scroll.setWidget(content)
+        self._tabs.addTab(scroll, title)
 
     def _build_solver_tab(self):
         tab = QWidget()
@@ -439,6 +469,17 @@ class TaskPriorityPanel(Plugin):
 
     def shutdown_plugin(self):
         self._spin_timer.stop()
+        tabs = (self._cartesian_tab, self._bimanual_cartesian_tab)
+        for tab in tabs:
+            tab.request_shutdown()
+        deadline = time.monotonic() + 1.0
+        while (rclpy.ok() and not all(tab.shutdown_complete() for tab in tabs) and
+               time.monotonic() < deadline):
+            rclpy.spin_once(self._node, timeout_sec=0.02)
+        if not all(tab.shutdown_complete() for tab in tabs):
+            self._node.get_logger().warning("Timed out waiting for Cartesian goal cancellation")
+        for tab in tabs:
+            tab.destroy_clients()
         self._node.destroy_node()
         if self._owns_rclpy_context and rclpy.get_default_context().ok():
             rclpy.shutdown()
