@@ -81,12 +81,12 @@ def relative_reference_frame():
     return configured_reference_frame()
 
 
-def relative_pose_components(leader, follower):
-    """Both TF transforms share reference axes: dp=pF-pL, dq=qF*conjugate(qL)."""
-    position = [getattr(follower.translation, axis) - getattr(leader.translation, axis)
+def relative_pose_components(arm_a, arm_b):
+    """Both TF transforms share reference axes: dp=pB-pA, dq=qB*conjugate(qA)."""
+    position = [getattr(arm_b.translation, axis) - getattr(arm_a.translation, axis)
                 for axis in ("x", "y", "z")]
     quaternions = []
-    for transform in (leader, follower):
+    for transform in (arm_a, arm_b):
         values = [getattr(transform.rotation, axis) for axis in ("x", "y", "z", "w")]
         norm = math.hypot(*values)
         if not math.isfinite(norm) or norm < 1e-12:
@@ -138,10 +138,11 @@ class BimanualCartesianTab(QWidget):
         self.form_scroll.setWidget(content)
         layout.addWidget(self.form_scroll, 1)
         note = QLabel(
-            "Relative target: follower minus leader position, and follower/leader "
+            "Relative target: B minus A position, and B/A "
             "rotation difference, expressed in reference (base) axes. "
             "Positions are metres; angular constraints are radians. "
-            "Zero pose constraints remain strict; zero speed factors use server defaults. "
+            "Zero relative tolerances remain strict; zero speed factors use server defaults. "
+            "Joint movement weights are configured with planning.weights in the planner YAML. "
             "Backend activation is manual."
         )
         note.setWordWrap(True)
@@ -156,33 +157,31 @@ class BimanualCartesianTab(QWidget):
             edit.setCursorPosition(0)
             edit.setToolTip(edit.text())
             edit.textChanged.connect(edit.setToolTip)
-        self.leader_combo = QComboBox()
-        self.follower_combo = QComboBox()
+        self.arm_a_combo = QComboBox()
+        self.arm_b_combo = QComboBox()
         self._arm_frames = arm_frames()
-        for combo in (self.leader_combo, self.follower_combo):
+        for combo in (self.arm_a_combo, self.arm_b_combo):
             combo.setEditable(True)
             combo.addItems(list(self._arm_frames))
-        if self.follower_combo.count() > 1:
-            self.follower_combo.setCurrentIndex(1)
-        self.leader_tip_edit = QLineEdit(self._arm_frames[self.leader_combo.currentText()])
-        self.follower_tip_edit = QLineEdit(self._arm_frames[self.follower_combo.currentText()])
+        if self.arm_b_combo.count() > 1:
+            self.arm_b_combo.setCurrentIndex(1)
+        self.arm_a_tip_edit = QLineEdit(self._arm_frames[self.arm_a_combo.currentText()])
+        self.arm_b_tip_edit = QLineEdit(self._arm_frames[self.arm_b_combo.currentText()])
         self.reference_frame_edit = QLineEdit(relative_reference_frame())
         self.reference_frame_edit.setToolTip("Must match relative_reference_frame configured in the planner")
-        self.leader_tip_edit.setToolTip("TF tool link; must match the leader tip configured in the planner")
-        self.follower_tip_edit.setToolTip("TF tool link; must match the follower tip configured in the planner")
-        self.leader_combo.currentTextChanged.connect(
-            lambda name: self.leader_tip_edit.setText(self._arm_frames.get(name.strip(), "")))
-        self.follower_combo.currentTextChanged.connect(
-            lambda name: self.follower_tip_edit.setText(self._arm_frames.get(name.strip(), "")))
+        self.arm_a_tip_edit.setToolTip("TF tool link; must match arm A tip configured in the planner")
+        self.arm_b_tip_edit.setToolTip("TF tool link; must match arm B tip configured in the planner")
+        self.arm_a_combo.currentTextChanged.connect(
+            lambda name: self.arm_a_tip_edit.setText(self._arm_frames.get(name.strip(), "")))
+        self.arm_b_combo.currentTextChanged.connect(
+            lambda name: self.arm_b_tip_edit.setText(self._arm_frames.get(name.strip(), "")))
 
         self.xyz_edit = QLineEdit("0.0,0.0,0.0")
-        self.xyz_edit.setToolTip("Comma-separated follower-minus-leader X,Y,Z in reference axes, in metres")
+        self.xyz_edit.setToolTip("Comma-separated B-minus-A X,Y,Z in reference axes, in metres")
         self.quaternion_edit = QLineEdit("0.0,0.0,0.0,1.0")
-        self.quaternion_edit.setToolTip("Relative rotation R_follower * R_leader^T in reference axes; quaternion XYZW")
+        self.quaternion_edit.setToolTip("Relative rotation R_arm_b * R_arm_a^T in reference axes; quaternion XYZW")
         self.read_pose_button = QPushButton("Read Relative Pose (TF)")
         self.read_pose_button.clicked.connect(self._read_pose)
-        self.radius_spin = self._spin(0.03, 100.0, 0.01)
-        self.leader_angles, leader_angles_row = self._vector_row(0.1, math.pi, ("Roll", "Pitch", "Yaw"))
         self.position_tolerances, position_row = self._vector_row(0.002, 100.0)
         self.orientation_tolerances, orientation_row = self._vector_row(0.03, math.pi)
         self.step_spin = self._spin(0.005, 1.0, 0.001)
@@ -201,15 +200,13 @@ class BimanualCartesianTab(QWidget):
 
         form.addRow("Action", self.action_edit)
         form.addRow("Execute Pending Service", self.execute_service_edit)
-        form.addRow("Leader", self.leader_combo)
-        form.addRow("Follower", self.follower_combo)
+        form.addRow("Arm A", self.arm_a_combo)
+        form.addRow("Arm B", self.arm_b_combo)
         form.addRow("Relative Reference Frame", self.reference_frame_edit)
-        form.addRow("Leader Tool Frame", self.leader_tip_edit)
-        form.addRow("Follower Tool Frame (TF)", self.follower_tip_edit)
+        form.addRow("Arm A Tool Frame", self.arm_a_tip_edit)
+        form.addRow("Arm B Tool Frame (TF)", self.arm_b_tip_edit)
         form.addRow("Relative XYZ [m]", self.xyz_edit)
         form.addRow("Relative Quaternion XYZW", self.quaternion_edit)
-        form.addRow("Leader Radius [m]", self.radius_spin)
-        form.addRow("Leader Orientation Limits [rad]", leader_angles_row)
         form.addRow("Relative Position Tolerances [m]", position_row)
         form.addRow("Relative Orientation Tolerances [rad]", orientation_row)
         form.addRow("Cartesian Step [m]", self.step_spin)
@@ -242,12 +239,12 @@ class BimanualCartesianTab(QWidget):
         footer.addRow("Result", self.result_label)
         layout.addLayout(footer)
         self._inputs = [
-            self.action_edit, self.execute_service_edit, self.leader_combo, self.follower_combo,
-            self.leader_tip_edit, self.follower_tip_edit, self.xyz_edit, self.quaternion_edit,
+            self.action_edit, self.execute_service_edit, self.arm_a_combo, self.arm_b_combo,
+            self.arm_a_tip_edit, self.arm_b_tip_edit, self.xyz_edit, self.quaternion_edit,
             self.reference_frame_edit,
-            self.read_pose_button, self.radius_spin, self.step_spin, self.planning_time_spin,
+            self.read_pose_button, self.step_spin, self.planning_time_spin,
             self.velocity_scaling_spin, self.acceleration_scaling_spin,
-            self.execute_checkbox, *self.leader_angles, *self.position_tolerances,
+            self.execute_checkbox, *self.position_tolerances,
             *self.orientation_tolerances,
         ]
         self._update_controls()
@@ -289,16 +286,16 @@ class BimanualCartesianTab(QWidget):
 
     def _read_pose(self):
         reference = self.reference_frame_edit.text().strip()
-        leader = self.leader_tip_edit.text().strip()
-        follower = self.follower_tip_edit.text().strip()
-        if not reference or not leader or not follower or leader == follower or reference in (leader, follower):
-            self._error("Enter a reference frame and distinct leader/follower tool frames")
+        arm_a = self.arm_a_tip_edit.text().strip()
+        arm_b = self.arm_b_tip_edit.text().strip()
+        if not reference or not arm_a or not arm_b or arm_a == arm_b or reference in (arm_a, arm_b):
+            self._error("Enter a reference frame and distinct arm A/B tool frames")
             return
         try:
-            leader_tf = self._tf_buffer.lookup_transform(reference, leader, Time())
-            follower_tf = self._tf_buffer.lookup_transform(
-                reference, follower, Time.from_msg(leader_tf.header.stamp))
-            position, quaternion = relative_pose_components(leader_tf.transform, follower_tf.transform)
+            arm_a_tf = self._tf_buffer.lookup_transform(reference, arm_a, Time())
+            arm_b_tf = self._tf_buffer.lookup_transform(
+                reference, arm_b, Time.from_msg(arm_a_tf.header.stamp))
+            position, quaternion = relative_pose_components(arm_a_tf.transform, arm_b_tf.transform)
         except (TransformException, ValueError) as error:
             self._error(f"Relative TF is unavailable: {error}")
             return
@@ -307,11 +304,11 @@ class BimanualCartesianTab(QWidget):
         self.result_label.setText(f"Current relative pose read in {reference}; edit XYZ to set an offset")
 
     def _goal_from_fields(self):
-        leader = self.leader_combo.currentText().strip()
-        follower = self.follower_combo.currentText().strip()
+        arm_a = self.arm_a_combo.currentText().strip()
+        arm_b = self.arm_b_combo.currentText().strip()
         frame = self.reference_frame_edit.text().strip()
-        if not leader or not follower or leader == follower:
-            raise ValueError("Leader and follower must be distinct configured arm names")
+        if not arm_a or not arm_b or arm_a == arm_b:
+            raise ValueError("Arm A and arm B must be distinct configured arm names")
         if not frame:
             raise ValueError("Enter the configured relative reference frame")
         xyz = numeric_vector(self.xyz_edit.text(), 3, "Relative XYZ")
@@ -320,16 +317,14 @@ class BimanualCartesianTab(QWidget):
         if norm < 1e-12 or not math.isfinite(norm):
             raise ValueError("Quaternion must have a finite, nonzero norm")
         goal = PlanBimanualCartesianTrajectory.Goal()
-        goal.leader_arm, goal.follower_arm = leader, follower
+        goal.arm_a, goal.arm_b = arm_a, arm_b
         goal.relative_target.header.frame_id = frame
         goal.relative_target.header.stamp = self._node.get_clock().now().to_msg()
         for axis, value in zip(("x", "y", "z"), xyz):
             setattr(goal.relative_target.pose.position, axis, value)
         for axis, value in zip(("x", "y", "z", "w"), quaternion):
             setattr(goal.relative_target.pose.orientation, axis, value / norm)
-        goal.leader_position_radius = self.radius_spin.value()
         for vector, spins in (
-            (goal.leader_orientation_threshold, self.leader_angles),
             (goal.relative_position_tolerance, self.position_tolerances),
             (goal.relative_orientation_tolerance, self.orientation_tolerances),
         ):

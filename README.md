@@ -11,7 +11,7 @@ ROS 2 RQT plugin for monitoring and interacting with the task-priority kinematic
 - Runtime target publication for supported tasks
 - Single-arm Cartesian planning with absolute tool target, arm selection,
   per-goal task/controller backend and velocity/acceleration controls
-- Bimanual Cartesian planning with relative-pose input, leader constraints,
+- Bimanual Cartesian planning with relative-pose input, per-joint movement weights,
   progress feedback, explicit pending-plan execution, and cancellation
 
 Drag the horizontal divider between the task table and tabs to change their
@@ -64,13 +64,13 @@ ros2 launch sura_manipulation_actions manipulation_actions.launch.py \
   execution_backend:=controller use_rviz:=true
 ```
 
-Choose the leader and follower. **Read Relative Pose (TF)** reads both tool poses
+Choose arm A and arm B; neither has priority in the planner. **Read Relative Pose (TF)** reads both tool poses
 in **Relative Reference Frame**, at a common timestamp, and fills XYZ with
-`p_follower - p_leader`, and the quaternion with `R_follower * R_leader^T`.
+`p_arm_b - p_arm_a`, and the quaternion with `R_arm_b * R_arm_a^T`.
 Both are expressed in reference/base axes. Editing X by `0.01` requests one
-centimetre more separation along base X even if the leader is rotated.
+centimetre more separation along base X even if arm A is rotated.
 Identity quaternion requests equal tool orientations. This is a relative
-relationship, not the follower's absolute pose.
+relationship, not arm B's absolute pose.
 
 The reference must match `relative_reference_frame` in the planner (a model
 link independent of the commanded arms); it defaults to `cirtesub/base_link`.
@@ -79,12 +79,11 @@ Arm names, reference/tool frames, action and execute-service endpoints remain
 editable for other robots. Defaults are read from the installed planner YAML.
 
 The Alpha example uses `cirtesub/alpha_left/standard_jaws_tool` and
-`cirtesub/alpha_right/standard_jaws_tool`. Selecting the leader selects its
-corresponding tool frame; the reference/base frame stays the same when roles are
+`cirtesub/alpha_right/standard_jaws_tool`. Selecting either arm selects its
+corresponding tool frame; the reference/base frame stays the same when A/B are
 swapped. Read the pose again after swapping to obtain the reversed relationship.
 
-Set the leader radius in metres, roll/pitch/yaw limits in radians, and relative
-position/orientation tolerances per component. Zero is a strict constraint.
+Set relative position/orientation tolerances per component. Zero is a strict constraint.
 Quaternions are entered as XYZW and normalized before sending. Zero planning
 time or Cartesian step selects the server's configured default.
 
@@ -94,8 +93,15 @@ uses the corresponding YAML value. Both controls default to zero. These factors
 change the timing shown in RViz and sent to either backend; **Planning Time**
 is only the computation budget. Inputs are locked while a goal is active:
 cancel the active goal, choose new factors and send another goal to change speed.
-The action interface now includes these two fields: rebuild both the action and
-RQT packages, then restart the server and clients after updating.
+Configure joint movement penalties in the server YAML with `planning.weights`.
+In Alpha the order is left b,c,d,e, then right b,c,d,e. A larger value discourages
+moving that joint away from its measured initial position; zero adds no penalty
+and does not lock it. Weights stay on the same joints when A/B are swapped.
+Restart the server after editing its YAML and configure it again, or use cleanup,
+update the ROS parameter and configure. This discards any pending plan.
+The action now uses `arm_a`/`arm_b` and `arm_a_path`/`arm_b_path`, and has no arm
+radius/orientation fields. Rebuild the action and RQT packages and restart clients
+to use this interface.
 
 **Send Goal** plans and publishes the robot trajectory in RViz. Execution is
 unchecked by default: the goal remains in `waiting_for_execute`. Review the plan

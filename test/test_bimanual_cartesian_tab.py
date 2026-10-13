@@ -101,16 +101,15 @@ class CartesianTabTest(unittest.TestCase):
     def test_goal_preserves_zero_constraints_and_normalizes_orientation(self):
         self.tab.xyz_edit.setText("0.1,-0.2,0.3")
         self.tab.quaternion_edit.setText("0,0,0,2")
-        self.tab.radius_spin.setValue(0.0)
-        for spin in self.tab.leader_angles + self.tab.position_tolerances + self.tab.orientation_tolerances:
+        for spin in self.tab.position_tolerances + self.tab.orientation_tolerances:
             spin.setValue(0.0)
         goal = self.tab._goal_from_fields()
-        self.assertEqual((goal.leader_arm, goal.follower_arm), ("arm_a", "arm_b"))
+        self.assertEqual((goal.arm_a, goal.arm_b), ("arm_a", "arm_b"))
         self.assertEqual(goal.relative_target.header.frame_id, "robot_base")
         self.assertEqual(goal.relative_target.pose.position.y, -0.2)
         self.assertEqual(goal.relative_target.pose.orientation.w, 1.0)
-        self.assertEqual(goal.leader_position_radius, 0.0)
-        self.assertEqual(goal.leader_orientation_threshold.z, 0.0)
+        self.assertFalse(hasattr(self.tab, "radius_spin"))
+        self.assertFalse(hasattr(self.tab, "arm_a_angles"))
         self.assertEqual(goal.relative_position_tolerance.x, 0.0)
         self.assertEqual(goal.relative_orientation_tolerance.y, 0.0)
         self.assertEqual(goal.cartesian_step, 0.005)
@@ -149,9 +148,9 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(goal.acceleration_scaling, 0.05)
 
     def test_custom_arms_frames_and_action_endpoint_are_used(self):
-        self.tab.leader_combo.setEditText("different_leader")
-        self.tab.follower_combo.setEditText("different_follower")
-        self.tab.leader_tip_edit.setText("new_leader_tool")
+        self.tab.arm_a_combo.setEditText("different_arm_a")
+        self.tab.arm_b_combo.setEditText("different_arm_b")
+        self.tab.arm_a_tip_edit.setText("new_arm_a_tool")
         self.tab.reference_frame_edit.setText("other_robot/base")
         self.tab.action_edit.setText("/other_robot/cartesian_plan")
         self.tab.execute_checkbox.setChecked(True)
@@ -159,7 +158,7 @@ class CartesianTabTest(unittest.TestCase):
         module.ActionClient.assert_called_once_with(
             self.node, PlanBimanualCartesianTrajectory, "/other_robot/cartesian_plan")
         goal = self.client.send_goal_async.call_args.args[0]
-        self.assertEqual(goal.leader_arm, "different_leader")
+        self.assertEqual(goal.arm_a, "different_arm_a")
         self.assertEqual(goal.relative_target.header.frame_id, "other_robot/base")
         self.assertTrue(goal.execute)
         self.node.create_client.assert_not_called()
@@ -173,22 +172,22 @@ class CartesianTabTest(unittest.TestCase):
         self.tab.quaternion_edit.setText("0,0,0,0")
         self.tab.send_button.click()
         self.tab.quaternion_edit.setText("0,0,0,1")
-        self.tab.follower_combo.setEditText("arm_a")
+        self.tab.arm_b_combo.setEditText("arm_a")
         self.tab.send_button.click()
         module.ActionClient.assert_not_called()
         self.assertTrue(self.tab.send_button.isEnabled())
 
     def test_current_relative_pose_reads_both_tools_in_base_at_same_time(self):
-        leader = TransformStamped()
-        leader.header.stamp.sec = 42
-        leader.transform.translation.x = 0.2
-        leader.transform.rotation.z = math.sin(math.pi / 4)
-        leader.transform.rotation.w = math.cos(math.pi / 4)
-        follower = TransformStamped()
-        follower.transform.translation.x = 0.62
-        follower.transform.translation.z = -0.03
-        follower.transform.rotation.w = 1.0
-        self.buffer.lookup_transform.side_effect = [leader, follower]
+        arm_a = TransformStamped()
+        arm_a.header.stamp.sec = 42
+        arm_a.transform.translation.x = 0.2
+        arm_a.transform.rotation.z = math.sin(math.pi / 4)
+        arm_a.transform.rotation.w = math.cos(math.pi / 4)
+        arm_b = TransformStamped()
+        arm_b.transform.translation.x = 0.62
+        arm_b.transform.translation.z = -0.03
+        arm_b.transform.rotation.w = 1.0
+        self.buffer.lookup_transform.side_effect = [arm_a, arm_b]
         self.tab.read_pose_button.click()
         calls = self.buffer.lookup_transform.call_args_list
         self.assertEqual(calls[0].args[:2], ("robot_base", "tool_a"))
@@ -203,18 +202,18 @@ class CartesianTabTest(unittest.TestCase):
         module.ActionClient.assert_not_called()
 
     def test_swapping_roles_keeps_reference_and_inverts_relative_components(self):
-        leader = TransformStamped().transform
-        follower = TransformStamped().transform
-        leader.rotation.y, leader.rotation.w = math.sin(0.3), math.cos(0.3)
-        follower.rotation.x, follower.rotation.w = math.sin(-0.2), math.cos(-0.2)
-        follower.translation.x = 0.5
-        first_p, first_q = module.relative_pose_components(leader, follower)
-        swapped_p, swapped_q = module.relative_pose_components(follower, leader)
+        arm_a = TransformStamped().transform
+        arm_b = TransformStamped().transform
+        arm_a.rotation.y, arm_a.rotation.w = math.sin(0.3), math.cos(0.3)
+        arm_b.rotation.x, arm_b.rotation.w = math.sin(-0.2), math.cos(-0.2)
+        arm_b.translation.x = 0.5
+        first_p, first_q = module.relative_pose_components(arm_a, arm_b)
+        swapped_p, swapped_q = module.relative_pose_components(arm_b, arm_a)
         self.assertEqual(swapped_p, [-value for value in first_p])
         for value, expected in zip(swapped_q, [-first_q[0], -first_q[1], -first_q[2], first_q[3]]):
             self.assertAlmostEqual(value, expected)
-        self.tab.leader_combo.setEditText("arm_b")
-        self.tab.follower_combo.setEditText("arm_a")
+        self.tab.arm_a_combo.setEditText("arm_b")
+        self.tab.arm_b_combo.setEditText("arm_a")
         self.assertEqual(self.tab._goal_from_fields().relative_target.header.frame_id, "robot_base")
 
     def test_tf_failure_does_not_change_target_or_send_goal(self):
