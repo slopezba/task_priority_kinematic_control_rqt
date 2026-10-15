@@ -66,7 +66,12 @@ class CartesianTabTest(unittest.TestCase):
             patcher = patch.object(module, name, replacement)
             patcher.start()
             self.addCleanup(patcher.stop)
+        patcher = patch('task_priority_kinematic_control_rqt.planning_markers.target_interfaces',
+                        side_effect=ImportError('isolated manual UI test'))
+        patcher.start()
+        self.addCleanup(patcher.stop)
         self.tab = module.BimanualCartesianTab(self.node)
+        self.tab._markers.show.setChecked(False)
 
     def tearDown(self):
         self.tab.request_shutdown()
@@ -251,6 +256,7 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(handle.cancel_calls, 1)
         handle.cancellation.set_result(SimpleNamespace(goals_canceling=[object()]))
         self.complete(handle, False, GoalStatus.STATUS_CANCELED)
+        self.assertTrue(self.tab._markers.editable)
         self.assertTrue(self.tab.send_button.isEnabled())
         self.assertFalse(self.tab.execute_button.isEnabled())
         self.assertIn("canceled:", self.tab.result_label.text())
@@ -317,6 +323,7 @@ class CartesianTabTest(unittest.TestCase):
         self.service.call_async.assert_called_once()
 
 
+
 class PanelIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -337,6 +344,7 @@ class PanelIntegrationTest(unittest.TestCase):
                 patch.object(panel.TaskPriorityPanel, "_refresh_tasks"), \
                 patch.object(panel.TaskPriorityPanel, "_read_solver_parameters"), \
                 patch.object(panel.TaskPriorityPanel, "_read_gain_parameters"), \
+                patch('task_priority_kinematic_control_rqt.planning_markers.MarkerTransport'), \
                 patch.object(module, "Buffer"), patch.object(module, "TransformListener"):
             ros_context.return_value.ok.return_value = True
             plugin = panel.TaskPriorityPanel(context)
@@ -349,7 +357,13 @@ class PanelIntegrationTest(unittest.TestCase):
             self.assertEqual(module.TransformListener.call_count, 2)
             module.TransformListener.assert_any_call(
                 plugin._bimanual_cartesian_tab._tf_buffer, node, spin_thread=False)
+            cart = plugin._cartesian_tab
+            pair = plugin._bimanual_cartesian_tab
+            self.assertFalse(hasattr(cart._markers, 'server'))
+            self.assertFalse(hasattr(pair._markers, 'server'))
             plugin.shutdown_plugin()
+            self.assertTrue(cart._markers.closed)
+            self.assertTrue(pair._markers.closed)
             node.destroy_node.assert_called_once()
             context.widget.close()
 

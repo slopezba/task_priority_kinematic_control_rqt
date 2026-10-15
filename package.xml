@@ -11,19 +11,26 @@
   <buildtool_depend>ament_python</buildtool_depend>
 
   <depend>rclpy</depend>
+  <depend>rcl_interfaces</depend>
   <depend>action_msgs</depend>
   <depend>ament_index_python</depend>
   <depend>python_qt_binding</depend>
   <depend>rqt_gui</depend>
   <depend>rqt_gui_py</depend>
   <depend>geometry_msgs</depend>
+  <depend>interactive_markers</depend>
+  <depend>visualization_msgs</depend>
   <depend>std_srvs</depend>
   <depend>sura_manipulation_actions</depend>
   <depend>tf2_ros</depend>
   <depend>task_priority_kinematic_control</depend>
   <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>alpha_description</exec_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <test_depend>python3-pytest</test_depend>
   <test_depend>builtin_interfaces</test_depend>
+  <test_depend>std_msgs</test_depend>
   <test_depend>trajectory_msgs</test_depend>
 
   <export>

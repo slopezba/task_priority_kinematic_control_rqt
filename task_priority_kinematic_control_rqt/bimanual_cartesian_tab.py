@@ -15,6 +15,8 @@ from std_srvs.srv import Trigger
 from sura_manipulation_actions.action import PlanBimanualCartesianTrajectory
 from tf2_ros import Buffer, TransformException, TransformListener
 
+from .planning_markers import PlanningMarkerEditor, pose_from_transform
+
 
 DEFAULT_ACTION = "/cirtesub/manipulation/plan_bimanual_cartesian_trajectory"
 DEFAULT_SERVER = "/plan_bimanual_cartesian_trajectory_lifecycle_action_server"
@@ -247,6 +249,7 @@ class BimanualCartesianTab(QWidget):
             self.execute_checkbox, *self.position_tolerances,
             *self.orientation_tolerances,
         ]
+        self._markers = PlanningMarkerEditor(self, form, bimanual=True)
         self._update_controls()
 
     @staticmethod
@@ -279,12 +282,16 @@ class BimanualCartesianTab(QWidget):
             self._waiting and self._goal_handle is not None and
             self._execute_future is None and not self._cancel_requested and not self._closed)
         self.cancel_button.setEnabled(self._busy and not self._cancel_requested and not self._closed)
+        if hasattr(self, "_markers"):
+            self._markers.set_editable(editable)
 
     def _error(self, message):
         if not self._closed:
             self.result_label.setText(f"Error: {message}")
 
     def _read_pose(self):
+        if self._markers.read_pose():
+            return
         reference = self.reference_frame_edit.text().strip()
         arm_a = self.arm_a_tip_edit.text().strip()
         arm_b = self.arm_b_tip_edit.text().strip()
@@ -301,6 +308,8 @@ class BimanualCartesianTab(QWidget):
             return
         self.xyz_edit.setText(",".join(f"{value:.12g}" for value in position))
         self.quaternion_edit.setText(",".join(f"{value:.12g}" for value in quaternion))
+        self._markers.set_poses([pose_from_transform(arm_a_tf.transform),
+                                pose_from_transform(arm_b_tf.transform)], reference)
         self.result_label.setText(f"Current relative pose read in {reference}; edit XYZ to set an offset")
 
     def _goal_from_fields(self):
@@ -342,6 +351,7 @@ class BimanualCartesianTab(QWidget):
             return
         try:
             goal = self._goal_from_fields()
+            self._markers.commit_fields()
             name = self.action_edit.text().strip()
             if not name:
                 raise ValueError("Enter the Cartesian action endpoint")
@@ -365,13 +375,34 @@ class BimanualCartesianTab(QWidget):
             self.progress.setValue(0)
             self.feedback_label.setText("Sending Cartesian goal...")
             self.result_label.clear()
-            self._send_future = self._client.send_goal_async(
-                goal, feedback_callback=lambda msg: self._feedback(msg, generation))
-            self._send_future.add_done_callback(lambda future: self._accepted(future, generation))
+            self._update_controls()
+            self._markers.prepare_goal(goal,
+                lambda target: self._dispatch_goal(target, generation),
+                lambda error: self._target_preparation_failed(error, generation))
         except Exception as error:
             self._busy = False
             self._error(str(error))
         self._update_controls()
+
+    def _target_preparation_failed(self, error, generation):
+        if generation != self._generation:
+            return
+        self._busy = self._waiting = False
+        self._error(error)
+        self._update_controls()
+
+    def _dispatch_goal(self, goal, generation):
+        if generation != self._generation or self._closed or self._cancel_requested:
+            self._busy = False
+            self._cancel_acknowledged = True
+            self._update_controls()
+            return
+        try:
+            self._send_future = self._client.send_goal_async(
+                goal, feedback_callback=lambda msg: self._feedback(msg, generation))
+            self._send_future.add_done_callback(lambda future: self._accepted(future, generation))
+        except Exception as error:
+            self._target_preparation_failed(str(error), generation)
 
     def _accepted(self, future, generation):
         if generation != self._generation:
@@ -384,6 +415,7 @@ class BimanualCartesianTab(QWidget):
                 self._error("Cartesian goal rejected")
                 return
             self._goal_handle = handle
+            self._markers.bind_goal(handle)
             handle.get_result_async().add_done_callback(
                 lambda result: self._result(result, generation))
             if self._cancel_requested or self._closed:
@@ -508,6 +540,7 @@ class BimanualCartesianTab(QWidget):
 
     def request_shutdown(self):
         self._closed = True
+        self._markers.close()
         self._cancel_goal()
         self._update_controls()
 
@@ -515,6 +548,7 @@ class BimanualCartesianTab(QWidget):
         return not self._busy or self._cancel_acknowledged
 
     def destroy_clients(self):
+        self._markers.close()
         self._tf_listener.unregister()
         self._clear_execute_client()
         if self._client is not None:
