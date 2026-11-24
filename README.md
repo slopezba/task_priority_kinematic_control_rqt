@@ -18,6 +18,11 @@ Drag the horizontal divider between the task table and tabs to change their
 heights. All tabs support scrolling when the panel is shortened, so long forms
 do not impose a large minimum window height.
 
+The diagnostic text in the Cartesian and Bimanual Cartesian tabs supports mouse
+selection, Ctrl+C and the context menu. **Copy diagnostics** copies all displayed
+diagnostics, including progress and any proposed posture. The progress bar also
+offers **Copy progress** in its context menu.
+
 ## Cartesian tab
 
 **Cartesian** calls `/cirtesub/manipulation/plan_cartesian_trajectory` with
@@ -36,6 +41,17 @@ joint counts. Sending is blocked until the catalog is valid. The parameter
 service is derived from **Execute Pending Service**, so update that endpoint
 when using a renamed server. Refresh can retry a pending metadata request.
 The **Pose** backend does not require a joint catalog.
+
+**Use STPIK** defaults to checked. It sends `use_stpik=true` in the Cartesian goal
+and enables isolated Task Priority validation when executing Pose. Unchecking it
+sends `false` and skips the offline check; live tracking supervision stays active.
+The checkbox is available for Pose and Server default, and is frozen after Send
+Goal, including while a plan is pending. Other backends ignore the field.
+STPIK uses the goal's **Tool Path/Goal Tracking Tolerance** and **Goal Time Tolerance**
+directly, without an additional controller-side Cartesian error cap. A failed
+stall check reports position/orientation/both, requested and measured movement,
+error reduction and the configured minimum progress in action feedback.
+After updating this action interface, rebuild and restart RQT and the action server.
 
 The six base checkboxes default to off and the arm joint checkboxes default to
 on. The goal's `available_dofs` is `[x, y, z, roll, pitch, yaw, joints...]` in the
@@ -84,7 +100,7 @@ count. Cancellation uses the shared action client, including late acceptance
 and panel shutdown. **Release Trajectory Hold** is an explicit controller
 service call to release trajectory ownership after the goal ends and restore
 manual tasks; it stays disabled while this tab has an active goal. Its endpoint
-defaults to `/cirtesub/controller/task_priority/release_cartesian_trajectory`.
+defaults to `/cirtesub/alpha/controller/task_priority/release_cartesian_trajectory`.
 In **Pose**, pending execution and cancellation use the same action/services;
 feedback reports tool error and the result reports tool pose count. Cancellation
 holds the measured tool pose and restores the task's temporary settings. The

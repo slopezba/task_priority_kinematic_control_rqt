@@ -7,8 +7,10 @@ from ament_index_python.packages import get_package_share_directory
 from action_msgs.msg import GoalStatus
 from python_qt_binding.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QAction, QApplication, QLabel, QLineEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
+from python_qt_binding.QtCore import Qt
+from python_qt_binding.QtGui import QKeySequence
 from rclpy.action import ActionClient
 from rclpy.time import Time
 from std_srvs.srv import Trigger
@@ -197,8 +199,21 @@ class BimanualCartesianTab(QWidget):
             spin.setDecimals(3)
             spin.setSpecialValueText("Server default")
             spin.setToolTip("Joint limit factor: 0.1 = 10%, 0.05 = 5%. Zero uses the server default")
+        self.backend_combo = QComboBox()
+        for label, value in (("Server default", ""), ("Controller", "controller"),
+                             ("Task", "task"), ("Pose", "pose")):
+            self.backend_combo.addItem(label, value)
+        self.backend_combo.setToolTip(
+            "Pose streams STPIK-validated poses to the left_pose / right_pose tasks; "
+            "Server default uses the planner's execution_backend parameter")
         self.execute_checkbox = QCheckBox("Execute after planning")
         self.execute_checkbox.setChecked(False)
+        self.stpik_checkbox = QCheckBox("Use STPIK")
+        self.stpik_checkbox.setChecked(True)
+        self.stpik_checkbox.setToolTip(
+            "Pose execution: validate both arms with STPIK before streaming poses. "
+            "Unchecked skips offline validation; execution still monitors tracking.")
+        self.backend_combo.currentIndexChanged.connect(lambda _index: self._update_controls())
 
         form.addRow("Action", self.action_edit)
         form.addRow("Execute Pending Service", self.execute_service_edit)
@@ -215,6 +230,8 @@ class BimanualCartesianTab(QWidget):
         form.addRow("Planning Time [s]", self.planning_time_spin)
         form.addRow("Velocity Scaling [0..1]", self.velocity_scaling_spin)
         form.addRow("Acceleration Scaling [0..1]", self.acceleration_scaling_spin)
+        form.addRow("Execution Backend", self.backend_combo)
+        form.addRow(self.stpik_checkbox)
         form.addRow(self.execute_checkbox)
 
         buttons = QHBoxLayout()
@@ -239,6 +256,7 @@ class BimanualCartesianTab(QWidget):
         footer.addRow("Progress", self.progress)
         footer.addRow("Feedback", self.feedback_label)
         footer.addRow("Result", self.result_label)
+        self._configure_diagnostic_copy(footer)
         layout.addLayout(footer)
         self._inputs = [
             self.action_edit, self.execute_service_edit, self.arm_a_combo, self.arm_b_combo,
@@ -246,7 +264,7 @@ class BimanualCartesianTab(QWidget):
             self.reference_frame_edit,
             self.read_pose_button, self.step_spin, self.planning_time_spin,
             self.velocity_scaling_spin, self.acceleration_scaling_spin,
-            self.execute_checkbox, *self.position_tolerances,
+            self.backend_combo, self.execute_checkbox, *self.position_tolerances,
             *self.orientation_tolerances,
         ]
         self._markers = PlanningMarkerEditor(self, form, bimanual=True)
@@ -260,6 +278,34 @@ class BimanualCartesianTab(QWidget):
         spin.setSingleStep(step)
         spin.setValue(value)
         return spin
+
+    def _configure_diagnostic_copy(self, footer):
+        for name in ("proposal_label", "feedback_label", "errors_label", "result_label"):
+            label = getattr(self, name, None)
+            if label is not None:
+                label.setTextFormat(Qt.PlainText)
+                label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard)
+                label.setFocusPolicy(Qt.StrongFocus)
+        self.progress.setFocusPolicy(Qt.StrongFocus)
+        self.progress.setContextMenuPolicy(Qt.ActionsContextMenu)
+        self.copy_progress_action = QAction("Copy progress", self.progress)
+        self.copy_progress_action.setShortcut(QKeySequence.Copy)
+        self.copy_progress_action.setShortcutContext(Qt.WidgetShortcut)
+        self.copy_progress_action.triggered.connect(
+            lambda: QApplication.clipboard().setText(self.progress.text()))
+        self.progress.addAction(self.copy_progress_action)
+        self.copy_diagnostics_button = QPushButton("Copy diagnostics")
+        self.copy_diagnostics_button.clicked.connect(self._copy_diagnostics)
+        footer.addRow(self.copy_diagnostics_button)
+
+    def _copy_diagnostics(self):
+        lines = [f"Progress: {self.progress.text()}"]
+        for title, name in (("Proposed posture", "proposal_label"), ("Feedback", "feedback_label"),
+                            ("Tracking Errors", "errors_label"), ("Result", "result_label")):
+            label = getattr(self, name, None)
+            if label is not None:
+                lines.append(f"{title}: {label.text()}")
+        QApplication.clipboard().setText("\n".join(lines))
 
     def _vector_row(self, value, maximum, labels=("X", "Y", "Z")):
         row = QHBoxLayout()
@@ -278,6 +324,8 @@ class BimanualCartesianTab(QWidget):
         for widget in self._inputs:
             widget.setEnabled(editable)
         self.send_button.setEnabled(editable)
+        if hasattr(self, "stpik_checkbox"):
+            self.stpik_checkbox.setEnabled(editable and self.backend_combo.currentData() in ("", "pose"))
         self.execute_button.setEnabled(
             self._waiting and self._goal_handle is not None and
             self._execute_future is None and not self._cancel_requested and not self._closed)
@@ -343,6 +391,8 @@ class BimanualCartesianTab(QWidget):
         goal.planning_time = self.planning_time_spin.value()
         goal.velocity_scaling = self.velocity_scaling_spin.value()
         goal.acceleration_scaling = self.acceleration_scaling_spin.value()
+        goal.execution_backend = self.backend_combo.currentData() or ""
+        goal.use_stpik = self.stpik_checkbox.isChecked()
         goal.execute = self.execute_checkbox.isChecked()
         return goal
 

@@ -1,4 +1,5 @@
 import functools
+import math
 import os
 import time
 
@@ -43,7 +44,12 @@ from sura_manipulation_actions.action import PlanJointTrajectory
 from .bimanual_cartesian_tab import BimanualCartesianTab
 from .cartesian_tab import CartesianTab
 
-from task_priority_kinematic_control.msg import ControllerOutput, HierarchyState, TaskState
+from task_priority_kinematic_control.msg import (
+    ControllerOutput,
+    FacingTarget,
+    HierarchyState,
+    TaskState,
+)
 from task_priority_kinematic_control.srv import (
     ListTasks,
     ReorderTasks,
@@ -52,8 +58,8 @@ from task_priority_kinematic_control.srv import (
     SetTaskJointActivation,
 )
 
-TASK_TOPIC_PREFIX = "/cirtesub/controller/task_priority/tasks"
-CONTROLLER_OUTPUT_TOPIC = "/cirtesub/controller/task_priority/output"
+TASK_TOPIC_PREFIX = "/cirtesub/alpha/controller/task_priority/tasks"
+CONTROLLER_OUTPUT_TOPIC = "/cirtesub/alpha/controller/task_priority/output"
 DEFAULT_CONTROLLER_NODE = "/cirtesub/alpha/controller/task_priority_controller"
 DEFAULT_PLAN_JOINT_TRAJECTORY_ACTION = "/cirtesub/manipulation/plan_joint_trajectory"
 DEFAULT_EXECUTE_PENDING_TRAJECTORY_SERVICE = (
@@ -69,6 +75,15 @@ DOF_WEIGHT_MAX = 20.0
 JOINT_TARGET_SCALE = 1000
 DEFAULT_JOINT_MIN = 0.0
 DEFAULT_JOINT_MAX = 6.1
+FACING_AXES = {
+    "+x": (1.0, 0.0, 0.0),
+    "-x": (-1.0, 0.0, 0.0),
+    "+y": (0.0, 1.0, 0.0),
+    "-y": (0.0, -1.0, 0.0),
+    "+z": (0.0, 0.0, 1.0),
+    "-z": (0.0, 0.0, -1.0),
+}
+FACING_GAIN_LABELS = ["left_aim_1", "left_aim_2", "right_aim_1", "right_aim_2", "roll", "distance"]
 DEFAULT_PREDEFINED_POSES = {
     "alpha_left": ["unfold", "grab_zip", "look_down", "extend", "fold", "home"],
     "alpha_right": ["unfold", "grab_zip", "look_down", "extend", "fold", "home"],
@@ -162,6 +177,7 @@ class TaskPriorityPanel(Plugin):
 
         self._pose_goal_pubs = {}
         self._joint_target_pubs = {}
+        self._facing_target_pubs = {}
         self._targetable_tasks = {}
         self._task_statuses = {}
         self._task_state_subs = {}
@@ -355,6 +371,7 @@ class TaskPriorityPanel(Plugin):
         pose_target_layout = QFormLayout(self._pose_target_widget)
         pose_target_layout.addRow("XYZ", self._goal_xyz)
         pose_target_layout.addRow("Quaternion XYZW", self._goal_quat)
+        self._facing_target_widget = self._build_facing_target_widget()
         self._joint_target_widget = QWidget()
         joint_target_layout = QVBoxLayout(self._joint_target_widget)
         joint_target_layout.addWidget(self._goal_joint_info)
@@ -375,9 +392,104 @@ class TaskPriorityPanel(Plugin):
         goal_layout.addRow("Task", self._goal_task_combo)
         goal_layout.addRow("Target Type", self._goal_target_type)
         goal_layout.addRow(self._pose_target_widget)
+        goal_layout.addRow(self._facing_target_widget)
         goal_layout.addRow(self._joint_target_widget)
         goal_layout.addRow(target_buttons)
         return tab
+
+    def _build_facing_target_widget(self):
+        widget = QWidget()
+        layout = QFormLayout(widget)
+        self._facing_left_axis_combo = QComboBox()
+        self._facing_right_axis_combo = QComboBox()
+        for name in FACING_AXES:
+            self._facing_left_axis_combo.addItem(name, name)
+            self._facing_right_axis_combo.addItem(name, name)
+        self._facing_left_axis_combo.setCurrentIndex(self._facing_left_axis_combo.findData("+z"))
+        self._facing_right_axis_combo.setCurrentIndex(self._facing_right_axis_combo.findData("+z"))
+        self._facing_roll_spin = QDoubleSpinBox()
+        self._facing_roll_spin.setRange(-180.0, 180.0)
+        self._facing_roll_spin.setDecimals(2)
+        self._facing_roll_spin.setSingleStep(5.0)
+        self._facing_roll_spin.setSuffix(" deg")
+        self._facing_keep_roll_checkbox = QCheckBox("Keep current roll")
+        self._facing_keep_roll_checkbox.toggled.connect(
+            lambda checked: self._facing_roll_spin.setEnabled(not checked)
+        )
+        roll_row = QHBoxLayout()
+        roll_row.addWidget(self._facing_roll_spin)
+        roll_row.addWidget(self._facing_keep_roll_checkbox)
+        self._facing_distance_spin = QDoubleSpinBox()
+        # Slider in millimetres (0.001-0.5 m); distance must be > 0 so it starts at 1 mm.
+        self._facing_distance_slider = QSlider(Qt.Horizontal)
+        self._facing_distance_slider.setRange(1, 500)
+        self._facing_distance_slider.setSingleStep(1)
+        self._facing_distance_slider.setPageStep(10)
+        self._facing_distance_spin.setRange(0.001, 0.5)
+        self._facing_distance_spin.setDecimals(3)
+        self._facing_distance_spin.setSingleStep(0.01)
+        self._facing_distance_spin.setSuffix(" m")
+        self._facing_distance_slider.valueChanged.connect(
+            lambda mm: self._facing_distance_spin.setValue(mm / 1000.0)
+        )
+        self._facing_distance_spin.valueChanged.connect(
+            lambda m: self._facing_distance_slider.setValue(int(round(m * 1000.0)))
+        )
+        self._facing_distance_spin.setValue(0.25)
+        distance_row = QHBoxLayout()
+        distance_row.addWidget(self._facing_distance_slider, 1)
+        distance_row.addWidget(self._facing_distance_spin)
+        help_label = QLabel(
+            "Each pointing axis (in its own EE frame) points to the other EE. "
+            "Roll zero: pointing x -> y, y -> z, z -> x (same sign); "
+            "roll is measured around the left->right line, from the left reference axis to the right one."
+        )
+        help_label.setWordWrap(True)
+        layout.addRow("Left pointing axis", self._facing_left_axis_combo)
+        layout.addRow("Right pointing axis", self._facing_right_axis_combo)
+        layout.addRow("Relative roll", roll_row)
+        layout.addRow("Distance", distance_row)
+        layout.addRow(help_label)
+        widget.setVisible(False)
+        return widget
+
+    def _sync_facing_goal_fields(self, task_id):
+        state = self._latest_task_states.get(task_id)
+        if state is None or len(state.target) != 8:
+            return
+        target = list(state.target)
+        for combo, axis in (
+            (self._facing_left_axis_combo, target[0:3]),
+            (self._facing_right_axis_combo, target[3:6]),
+        ):
+            for name, values in FACING_AXES.items():
+                if all(abs(a - b) < 1e-3 for a, b in zip(axis, values)):
+                    combo.setCurrentIndex(combo.findData(name))
+                    break
+        if math.isfinite(target[6]):
+            self._facing_roll_spin.setValue(math.degrees(target[6]))
+        if math.isfinite(target[7]) and target[7] > 0.0:
+            # Clamped to the slider range (0.001-0.5 m) by the spin box.
+            self._facing_distance_spin.setValue(target[7])
+
+    def _publish_facing_target(self, task_id):
+        topic_name = f"{TASK_TOPIC_PREFIX}/{task_id}/facing_target"
+        if task_id not in self._facing_target_pubs:
+            self._facing_target_pubs[task_id] = self._node.create_publisher(
+                FacingTarget, topic_name, 10
+            )
+        msg = FacingTarget()
+        msg.header.stamp = self._node.get_clock().now().to_msg()
+        left = FACING_AXES[self._facing_left_axis_combo.currentData()]
+        right = FACING_AXES[self._facing_right_axis_combo.currentData()]
+        msg.left_pointing_axis.x, msg.left_pointing_axis.y, msg.left_pointing_axis.z = left
+        msg.right_pointing_axis.x, msg.right_pointing_axis.y, msg.right_pointing_axis.z = right
+        if self._facing_keep_roll_checkbox.isChecked():
+            msg.roll_angle = float("nan")
+        else:
+            msg.roll_angle = math.radians(self._facing_roll_spin.value())
+        msg.distance = self._facing_distance_spin.value()
+        self._facing_target_pubs[task_id].publish(msg)
 
     def _build_errors_tab(self):
         tab = QWidget()
@@ -486,7 +598,17 @@ class TaskPriorityPanel(Plugin):
 
     def _spin_ros_once(self):
         if rclpy.ok():
-            rclpy.spin_once(self._node, timeout_sec=0.0)
+            # One callback per 50 ms cannot service all task-state subscriptions.
+            # Consume a bounded batch and render only the latest samples, leaving
+            # time for Qt events even while the controller streams at 100 Hz.
+            deadline = time.monotonic() + 0.01
+            for _ in range(2 * len(self._task_state_subs) + 16):
+                rclpy.spin_once(self._node, timeout_sec=0.0)
+                if time.monotonic() >= deadline:
+                    break
+            self._update_task_rows_from_statuses()
+            self._refresh_errors_table()
+            self._refresh_controller_output_table()
 
     def _spin_until_complete(self, future, timeout_sec=2.0):
         deadline = time.monotonic() + timeout_sec
@@ -765,6 +887,8 @@ class TaskPriorityPanel(Plugin):
     def _labels_for_gain(self, task, values):
         if task is not None and task.joint_names and len(task.joint_names) == len(values):
             return list(task.joint_names)
+        if task is not None and "EndEffectorsFacingTask" in task.plugin and len(values) == 6:
+            return list(FACING_GAIN_LABELS)
         if len(values) == 6:
             return ["x", "y", "z", "roll", "pitch", "yaw"]
         if len(values) == 3:
@@ -882,16 +1006,12 @@ class TaskPriorityPanel(Plugin):
             f"Backend: {msg.backend_name} | Solver: {msg.solver_method} | Ready: {msg.ready}"
         )
         self._task_statuses = {task.id: task for task in msg.tasks}
-        self._update_task_rows_from_statuses()
-        self._refresh_errors_table()
 
     def _on_task_state(self, task_id, msg):
         self._latest_task_states[task_id] = msg
-        self._refresh_errors_table()
 
     def _on_controller_output(self, msg):
         self._latest_controller_output = msg
-        self._refresh_controller_output_table()
 
     def _ensure_task_state_subscription(self, task_id):
         if task_id in self._task_state_subs:
@@ -901,7 +1021,7 @@ class TaskPriorityPanel(Plugin):
             TaskState,
             topic_name,
             functools.partial(self._on_task_state, task_id),
-            10,
+            1,
         )
 
     def _refresh_tasks(self, selected_task_id=None):
@@ -937,7 +1057,7 @@ class TaskPriorityPanel(Plugin):
             )
             self._table.setCellWidget(row, 4, checkbox)
             self._table.setItem(row, 5, QTableWidgetItem(task.status_message))
-            if task.target_type in ("pose", "joint_array"):
+            if task.target_type in ("pose", "joint_array", "facing"):
                 targetable_tasks[task.id] = task
 
         self._select_task_row(selected_task_id)
@@ -1337,6 +1457,7 @@ class TaskPriorityPanel(Plugin):
             self._goal_target_type.setText("No active target tasks")
             self._goal_joint_info.setText("")
             self._pose_target_widget.setVisible(False)
+            self._facing_target_widget.setVisible(False)
             self._joint_target_widget.setVisible(False)
             self._clear_layout(self._joint_target_layout)
             self._joint_target_controls = []
@@ -1348,6 +1469,7 @@ class TaskPriorityPanel(Plugin):
             self._goal_target_type.setText("PoseStamped")
             self._goal_joint_info.setText("")
             self._pose_target_widget.setVisible(True)
+            self._facing_target_widget.setVisible(False)
             self._joint_target_widget.setVisible(False)
             self._clear_layout(self._joint_target_layout)
             self._joint_target_controls = []
@@ -1361,15 +1483,30 @@ class TaskPriorityPanel(Plugin):
             self._goal_target_type.setText("Float64MultiArray")
             self._goal_joint_info.setText(joint_names)
             self._pose_target_widget.setVisible(False)
+            self._facing_target_widget.setVisible(False)
             self._joint_target_widget.setVisible(True)
             self._rebuild_joint_target_controls(task_id, task)
             self._live_joint_target_checkbox.setVisible(True)
             self._goal_button.setEnabled(True)
             return
 
+        if task.target_type == "facing":
+            self._goal_target_type.setText("FacingTarget")
+            self._goal_joint_info.setText("")
+            self._pose_target_widget.setVisible(False)
+            self._facing_target_widget.setVisible(True)
+            self._joint_target_widget.setVisible(False)
+            self._clear_layout(self._joint_target_layout)
+            self._joint_target_controls = []
+            self._live_joint_target_checkbox.setVisible(False)
+            self._sync_facing_goal_fields(task_id)
+            self._goal_button.setEnabled(True)
+            return
+
         self._goal_target_type.setText("Unsupported")
         self._goal_joint_info.setText("")
         self._pose_target_widget.setVisible(False)
+        self._facing_target_widget.setVisible(False)
         self._joint_target_widget.setVisible(False)
         self._clear_layout(self._joint_target_layout)
         self._joint_target_controls = []
@@ -1416,6 +1553,10 @@ class TaskPriorityPanel(Plugin):
 
         if task.target_type == "joint_array":
             self._publish_joint_target(task_id, task, show_errors=True)
+            return
+
+        if task.target_type == "facing":
+            self._publish_facing_target(task_id)
             return
 
         self._show_error("Selected task does not accept runtime targets")

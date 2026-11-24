@@ -18,7 +18,7 @@ from .planning_markers import PlanningMarkerEditor, pose_components, pose_from_c
 
 DEFAULT_ACTION = "/cirtesub/manipulation/plan_cartesian_trajectory"
 DEFAULT_SERVER = "/plan_cartesian_trajectory_lifecycle_action_server"
-DEFAULT_RELEASE_SERVICE = "/cirtesub/controller/task_priority/release_cartesian_trajectory"
+DEFAULT_RELEASE_SERVICE = "/cirtesub/alpha/controller/task_priority/release_cartesian_trajectory"
 BASE_AXES = ("X", "Y", "Z", "Roll", "Pitch", "Yaw")
 
 
@@ -74,6 +74,7 @@ class CartesianTab(BimanualCartesianTab):
         for label, value in (("Server default", ""), ("Controller", "controller"),
                              ("Task", "task"), ("Pose", "pose")):
             self.backend_combo.addItem(label, value)
+        self.backend_combo.setCurrentIndex(self.backend_combo.findData("pose"))
         self.backend_combo.currentIndexChanged.connect(self._base_dofs_changed)
         self.xyz_edit = QLineEdit("0.0,0.0,0.0")
         self.xyz_edit.setToolTip("Absolute X,Y,Z in metres in the selected target frame")
@@ -84,14 +85,31 @@ class CartesianTab(BimanualCartesianTab):
         self.step_spin = self._spin(0.02, 1.0, 0.001)
         self.planning_time_spin = self._spin(10.0, 3600.0, 1.0)
         self.planning_time_spin.setDecimals(2)
-        self.velocity_scaling_spin = self._spin(0.8, 1.0, 0.01)
-        self.acceleration_scaling_spin = self._spin(0.4, 1.0, 0.01)
+        self.velocity_scaling_spin = self._spin(0.1, 1.0, 0.01)
+        self.acceleration_scaling_spin = self._spin(0.5, 1.0, 0.01)
         for spin in (self.velocity_scaling_spin, self.acceleration_scaling_spin):
             spin.setDecimals(3)
             spin.setSpecialValueText("Server default")
             spin.setToolTip("Timing factor: 0.1 = 10%; zero uses server default. "
                             "Pose scales Cartesian limits; other backends scale joint/base timing.")
         self.execute_checkbox = QCheckBox("Execute after planning")
+        self.posture_checkbox = QCheckBox("Optimize initial posture (OSQP)")
+        self.posture_checkbox.setToolTip(
+            "Evaluate the full path for each starting configuration. Execute Pending applies the proposal.")
+        self.posture_checkbox.toggled.connect(self._posture_changed)
+        self.nominal_checkbox = QCheckBox("Optimize whole trajectory (robot_nominal)")
+        self.nominal_checkbox.setToolTip(
+            "Also plan a whole-body nominal (base pose and both arms) over the timed path, "
+            "honouring the Task Priority hierarchy captured at planning time, and stream it to "
+            "the low-priority robot_nominal task while executing. It optimizes the initial "
+            "posture itself, so it excludes 'Optimize initial posture'. Requires STPIK.")
+        self.nominal_checkbox.toggled.connect(self._nominal_changed)
+        self.use_stpik_checkbox = QCheckBox("Use STPIK")
+        self.use_stpik_checkbox.setChecked(True)
+        self.use_stpik_checkbox.setToolTip(
+            "Pose execution: simulate Task Priority before sending references. "
+            "Uses this goal's Tool Path/Goal Tracking Tolerances. "
+            "Unchecked skips offline validation; execution still monitors tracking.")
         for label, widget in (
             ("Action", self.action_edit), ("Execute Pending Service", self.execute_service_edit),
             ("Release Trajectory Service", self.release_service_edit),
@@ -158,6 +176,9 @@ class CartesianTab(BimanualCartesianTab):
         form.addRow("Tool Goal Tracking Tolerance [m, rad]", tip_goal_row)
         self.goal_time_spin = self._spin(0.5, 3600.0, 0.1)
         form.addRow("Goal Time Tolerance [s]", self.goal_time_spin)
+        form.addRow(self.posture_checkbox)
+        form.addRow(self.nominal_checkbox)
+        form.addRow(self.use_stpik_checkbox)
         form.addRow(self.execute_checkbox)
         self.read_pose_button = QPushButton("Read Current Pose (TF)")
         self.send_button = QPushButton("Send Goal")
@@ -181,16 +202,21 @@ class CartesianTab(BimanualCartesianTab):
         self.result_label, self.errors_label = QLabel(""), QLabel("")
         for label in (self.feedback_label, self.result_label, self.errors_label):
             label.setWordWrap(True)
+        self.proposal_label = QLabel("")
+        self.proposal_label.setWordWrap(True)
+        footer.addRow("Proposed posture", self.proposal_label)
         footer.addRow("Progress", self.progress)
         footer.addRow("Feedback", self.feedback_label)
         footer.addRow("Tracking Errors", self.errors_label)
         footer.addRow("Result", self.result_label)
+        self._configure_diagnostic_copy(footer)
         layout.addLayout(footer)
         self._inputs = [self.action_edit, self.execute_service_edit, self.release_service_edit,
                         self.arm_combo, self.backend_combo, self.reference_frame_edit, self.tool_frame_edit,
                         self.xyz_edit, self.quaternion_edit, self.step_spin, self.planning_time_spin,
                         self.velocity_scaling_spin, self.acceleration_scaling_spin,
-                        self.execute_checkbox, self.read_pose_button, self.base_bounds_checkbox,
+                        self.execute_checkbox, self.use_stpik_checkbox, self.posture_checkbox, self.nominal_checkbox,
+                        self.read_pose_button, self.base_bounds_checkbox,
                         self.refresh_joints_button, self.goal_time_spin,
                         *self.position_tolerances, *self.orientation_tolerances,
                         *self.base_dof_checks, *self.base_lower_spins, *self.base_upper_spins,
@@ -346,6 +372,18 @@ class CartesianTab(BimanualCartesianTab):
         self._markers.set_poses([pose_from_components(position, quaternion)], reference)
         self.result_label.setText(f"Current tool pose read in {reference}; edit XYZ to set the target")
 
+    def _posture_changed(self, checked):
+        if checked:
+            self.nominal_checkbox.setChecked(False)
+            self.use_stpik_checkbox.setChecked(True)
+        self._update_controls()
+
+    def _nominal_changed(self, checked):
+        if checked:
+            self.posture_checkbox.setChecked(False)
+            self.use_stpik_checkbox.setChecked(True)
+        self._update_controls()
+
     def _goal_from_fields(self):
         arm = self.arm_combo.currentText().strip()
         pose_mode = self.backend_combo.currentData() == "pose"
@@ -400,6 +438,11 @@ class CartesianTab(BimanualCartesianTab):
         if any(goal.available_dofs[:6]) and goal.execution_backend != "task":
             raise ValueError("Base motion requires the task backend")
         goal.execute = self.execute_checkbox.isChecked()
+        self.proposal_label.clear()
+        goal.optimize_trajectory_nominal = pose_mode and self.nominal_checkbox.isChecked()
+        goal.optimize_initial_posture = (pose_mode and self.posture_checkbox.isChecked()
+                                         and not goal.optimize_trajectory_nominal)
+        goal.use_stpik = self.use_stpik_checkbox.isChecked()
         return goal
 
     def _update_controls(self):
@@ -411,6 +454,11 @@ class CartesianTab(BimanualCartesianTab):
             for widget in self._inputs:
                 widget.setEnabled(False)
         pose_mode = self.backend_combo.currentData() == "pose"
+        self.nominal_checkbox.setEnabled(editable and pose_mode)
+        self.posture_checkbox.setEnabled(editable and pose_mode)
+        optimizing = self.posture_checkbox.isChecked() or self.nominal_checkbox.isChecked()
+        self.use_stpik_checkbox.setEnabled(editable and self.backend_combo.currentData() in ("", "pose")
+                                           and not (pose_mode and optimizing))
         arm = self.arm_combo.currentText().strip()
         self.send_button.setEnabled(editable and bool(arm) and (pose_mode or self._catalog_arm == arm))
         # Refresh can replace a lost/unanswered metadata request.
@@ -434,6 +482,22 @@ class CartesianTab(BimanualCartesianTab):
         feedback = message.feedback
         def values(items):
             return ", ".join(f"{float(value):.4g}" for value in items)
+        proposal = getattr(feedback, "proposal", None)
+        if proposal and proposal.preparation_id:
+            config = proposal.configuration
+            p, q = config.base.pose.position, config.base.pose.orientation
+            joints = ", ".join(f"{name}={angle:.3f}" for name, angle in zip(config.joint_names, config.positions))
+            if not proposal.baseline_feasible:
+                baseline = "infeasible"
+            elif math.isnan(proposal.baseline_cost):
+                baseline = "n/a"
+            else:
+                baseline = f"{proposal.baseline_cost:.4g}"
+            self.proposal_label.setText(
+                f"Base ({config.base.header.frame_id}) XYZ [m] [{values((p.x, p.y, p.z))}], "
+                f"XYZW [{values((q.x, q.y, q.z, q.w))}] | Joints [rad] {joints}\n"
+                f"Cost {baseline} → {proposal.cost:.4g} | Peak tilt {math.degrees(proposal.peak_tilt):.2f}° | "
+                f"Joint margin {proposal.minimum_joint_margin:.3f} rad | Clearance {proposal.minimum_clearance:.3f} m")
         tool_errors = f"Tool XYZ/rotation: [{values(feedback.tip_error)}]"
         self.errors_label.setText(tool_errors if self.backend_combo.currentData() == "pose" else
                                  f"Base XYZ/RPY: [{values(feedback.base_error)}] | "

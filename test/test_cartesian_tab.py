@@ -12,6 +12,8 @@ from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Duration, Time
 from geometry_msgs.msg import PoseStamped, TransformStamped, Vector3
 from python_qt_binding.QtWidgets import QApplication
+from python_qt_binding.QtCore import Qt
+from python_qt_binding.QtTest import QTest
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters
 
@@ -29,7 +31,7 @@ def ui_goal():
         tracking_tolerances=SimpleNamespace(base_path=[], base_goal=[], joint_path=[], joint_goal=[],
                                            tip_path=[], tip_goal=[], goal_time_tolerance=Duration()),
         cartesian_step=0.0, planning_time=0.0, velocity_scaling=0.0, acceleration_scaling=0.0,
-        execution_backend="", execute=False)
+        execution_backend="", use_stpik=True, execute=False)
 
 
 class CartesianTabTest(unittest.TestCase):
@@ -103,7 +105,31 @@ class CartesianTabTest(unittest.TestCase):
         self.tab.destroy_clients()
         self.tab.deleteLater()
 
+    def test_diagnostics_support_selection_keyboard_copy_and_copy_all(self):
+        self.tab.progress.setValue(80)
+        self.tab.proposal_label.setText("Base XYZ [1, 2, 3]")
+        self.tab.feedback_label.setText("waiting_for_execute: ready")
+        self.tab.errors_label.setText("Tool [0, 0, 0]")
+        self.tab.result_label.setText("result details")
+        for label in (self.tab.proposal_label, self.tab.feedback_label,
+                      self.tab.errors_label, self.tab.result_label):
+            self.assertTrue(label.textInteractionFlags() & Qt.TextSelectableByMouse)
+            self.assertTrue(label.textInteractionFlags() & Qt.TextSelectableByKeyboard)
+        self.tab.show()
+        self.tab.result_label.setFocus()
+        self.tab.result_label.setSelection(0, len(self.tab.result_label.text()))
+        QTest.keyClick(self.tab.result_label, Qt.Key_C, Qt.ControlModifier)
+        self.assertEqual(QApplication.clipboard().text(), "result details")
+        self.tab.copy_diagnostics_button.click()
+        copied = QApplication.clipboard().text()
+        for text in ("80%", "Base XYZ [1, 2, 3]", "waiting_for_execute: ready",
+                     "Tool [0, 0, 0]", "result details"):
+            self.assertIn(text, copied)
+        self.tab.copy_progress_action.trigger()
+        self.assertEqual(QApplication.clipboard().text(), "80%")
+
     def test_default_mask_uses_server_order_and_world_frame(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         self.tab.xyz_edit.setText("0.4,-0.2,0.1")
         self.tab.quaternion_edit.setText("0,0,0,2")
         self.tab.velocity_scaling_spin.setValue(0.05)
@@ -121,6 +147,84 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(goal.acceleration_scaling, 0.2)
         self.assertEqual(goal.execution_backend, "")
         self.assertFalse(goal.execute)
+        self.assertTrue(goal.use_stpik)
+
+    def test_pose_goal_exposes_stpik_toggle_and_freezes_it_while_pending(self):
+        goal = self.tab._goal_from_fields()
+        self.assertEqual(self.tab.backend_combo.currentData(), "pose")
+        self.assertEqual(goal.execution_backend, "pose")
+        self.assertEqual(goal.velocity_scaling, 0.1)
+        self.assertEqual(goal.acceleration_scaling, 0.5)
+        self.assertTrue(self.tab.use_stpik_checkbox.isEnabled())
+        self.assertTrue(self.tab._goal_from_fields().use_stpik)
+        self.tab.use_stpik_checkbox.setChecked(False)
+        self.tab.tip_path_spins[2].setValue(0.21)
+        self.tab.tip_goal_spins[2].setValue(0.22)
+        self.tab.send_button.click()
+        goal = self.client.send_goal_async.call_args.args[0]
+        self.assertFalse(goal.use_stpik)
+        self.assertEqual(goal.tracking_tolerances.tip_path[2], 0.21)
+        self.assertEqual(goal.tracking_tolerances.tip_goal[2], 0.22)
+        self.acceptance.set_result(FakeHandle())
+        self.tab._feedback(self.feedback(), self.tab._generation)
+        self.assertFalse(self.tab.use_stpik_checkbox.isEnabled())
+
+    def test_posture_preview_requires_pose_and_stpik(self):
+        self.assertFalse(self.tab._goal_from_fields().optimize_initial_posture)
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("pose"))
+        self.tab.use_stpik_checkbox.setChecked(False)
+        self.tab.posture_checkbox.setChecked(True)
+        goal = self.tab._goal_from_fields()
+        self.assertTrue(goal.optimize_initial_posture)
+        self.assertTrue(goal.use_stpik)
+        self.assertFalse(goal.execute)
+        self.assertFalse(self.tab.use_stpik_checkbox.isEnabled())
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("task"))
+        self.assertFalse(self.tab.posture_checkbox.isEnabled())
+        self.assertFalse(self.tab._goal_from_fields().optimize_initial_posture)
+
+    def test_whole_trajectory_nominal_excludes_posture_and_requires_stpik(self):
+        self.assertFalse(self.tab._goal_from_fields().optimize_trajectory_nominal)
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("pose"))
+        self.tab.use_stpik_checkbox.setChecked(False)
+        self.tab.posture_checkbox.setChecked(True)
+        self.tab.nominal_checkbox.setChecked(True)
+        self.assertFalse(self.tab.posture_checkbox.isChecked())
+        goal = self.tab._goal_from_fields()
+        self.assertTrue(goal.optimize_trajectory_nominal)
+        self.assertFalse(goal.optimize_initial_posture)
+        self.assertTrue(goal.use_stpik)
+        self.assertFalse(self.tab.use_stpik_checkbox.isEnabled())
+        self.tab.posture_checkbox.setChecked(True)
+        self.assertFalse(self.tab.nominal_checkbox.isChecked())
+        goal = self.tab._goal_from_fields()
+        self.assertTrue(goal.optimize_initial_posture)
+        self.assertFalse(goal.optimize_trajectory_nominal)
+        self.tab.nominal_checkbox.setChecked(True)
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("task"))
+        self.assertFalse(self.tab.nominal_checkbox.isEnabled())
+        self.assertFalse(self.tab._goal_from_fields().optimize_trajectory_nominal)
+
+    def test_stpik_control_is_disabled_for_explicit_non_pose_backends(self):
+        self.tab.use_stpik_checkbox.setChecked(False)
+        for backend in ("task", "controller"):
+            self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(backend))
+            self.assertFalse(self.tab.use_stpik_checkbox.isEnabled())
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("pose"))
+        self.assertTrue(self.tab.use_stpik_checkbox.isEnabled())
+        self.assertFalse(self.tab.use_stpik_checkbox.isChecked())
+
+    def test_stalled_feedback_shows_group_and_simulated_tracking_error(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("pose"))
+        self.tab.send_button.click()
+        self.acceptance.set_result(FakeHandle())
+        message = self.feedback("stpik_failed")
+        message.feedback.message = "STPIK STALLED; stalled=position; orientation_stalled=false"
+        message.feedback.tip_error = [0, 0, 0.00124, 0, 0, 0]
+        self.tab._feedback(message, self.tab._generation)
+        self.assertIn("stalled=position", self.tab.feedback_label.text())
+        self.assertIn("orientation_stalled=false", self.tab.feedback_label.text())
+        self.assertIn("0.00124", self.tab.errors_label.text())
 
     def test_base_mask_selects_task_and_disables_controller(self):
         self.tab.backend_combo.setCurrentIndex(1)
@@ -203,6 +307,7 @@ class CartesianTabTest(unittest.TestCase):
         self.assertTrue(self.tab.send_button.isEnabled())
 
     def test_joint_choices_follow_names_across_arm_switches(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         self.tab._joint_widgets[1][0].setChecked(False)
         self.tab._joint_widgets[1][1].setValue(0.12)
         self.tab.arm_combo.setCurrentText("arm_b")
@@ -212,6 +317,7 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(self.tab._goal_from_fields().tracking_tolerances.joint_path, [0.05, 0.12, 0.05])
 
     def test_limits_and_tracking_tolerances_are_independent_of_planning(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         goal = self.tab._goal_from_fields()
         self.assertEqual(goal.base_limits.lower_limits, [])
         self.assertEqual(goal.base_limits.max_velocity, [1.0] * 3 + [0.5] * 3)
@@ -251,6 +357,7 @@ class CartesianTabTest(unittest.TestCase):
         common.ActionClient.assert_not_called()
 
     def test_changing_frame_transforms_position_and_orientation(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         tf = TransformStamped()
         tf.transform.translation.x = 10.0
         tf.transform.rotation.z = math.sqrt(0.5)
@@ -278,6 +385,7 @@ class CartesianTabTest(unittest.TestCase):
         self.assertIn("missing frame", self.tab.result_label.text())
 
     def test_metadata_pending_disables_send_and_late_old_arm_is_ignored(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         self.auto_catalog = False
         self.tab._refresh_joint_catalog()
         arm_a_future = self.catalog_requests[-1][1]
@@ -291,6 +399,7 @@ class CartesianTabTest(unittest.TestCase):
         self.assertTrue(self.tab.send_button.isEnabled())
 
     def test_invalid_catalog_blocks_dispatch(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         self.joint_catalog["arm_a"] = ["duplicate", "duplicate"]
         self.tab._refresh_joint_catalog()
         self.assertFalse(self.tab.send_button.isEnabled())
@@ -299,6 +408,7 @@ class CartesianTabTest(unittest.TestCase):
         common.ActionClient.assert_not_called()
 
     def test_task_goal_waits_for_manual_execute_and_locks_all_controls(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         self.tab.arm_combo.setCurrentText("arm_b")
         self.tab.base_dof_checks[0].setChecked(True)
         self.tab.send_button.click()
@@ -340,6 +450,7 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(handle.cancel_calls, 1)
 
     def test_release_is_explicit_and_service_result_restores_controls(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData(""))
         self.tab.release_button.click()
         self.assertEqual(self.node.create_client.call_args.args[1], module.DEFAULT_RELEASE_SERVICE)
         self.assertFalse(self.tab.release_button.isEnabled())
