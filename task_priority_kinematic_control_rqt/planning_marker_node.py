@@ -1,11 +1,12 @@
 """Independent planning target server. No Qt imports and no robot commands."""
 from copy import deepcopy
 from dataclasses import dataclass, field, fields
+import math
 import time
 import uuid
 
 from action_msgs.msg import GoalStatus, GoalStatusArray
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, Vector3
 from interactive_markers.interactive_marker_server import InteractiveMarkerServer
 import rclpy
 from rclpy.clock import Clock, ClockType
@@ -17,9 +18,10 @@ from tf2_ros import Buffer, TransformListener, TransformException
 from visualization_msgs.msg import InteractiveMarkerFeedback
 
 from .marker_geometry import (
-    gripper_marker, normalized_pose, pose_from_transform, relative_pose,
-    reconstruct_b, transform_pose,
+    axis_name, facing_measure, facing_poses, gripper_marker, normalized_pose,
+    pose_components, pose_from_components, pose_from_transform, transform_pose,
 )
+from .tip_offset import TipOffset
 
 
 @dataclass
@@ -33,6 +35,10 @@ class Target:
     tool_frames: list = field(default_factory=list)
     tool_poses: list = field(default_factory=list)
     target_pose: PoseStamped = field(default_factory=PoseStamped)
+    left_pointing_axis: Vector3 = field(default_factory=lambda: Vector3(x=1.0))
+    right_pointing_axis: Vector3 = field(default_factory=lambda: Vector3(x=1.0))
+    roll_angle: float = 0.0
+    distance: float = 0.0
     visible: bool = True
     locked: bool = False
     owner_id: str = ""
@@ -51,20 +57,29 @@ class Target:
         return result
 
 
-def common_tool_poses(buffer, frame, tools):
+def pointing_names(target):
+    return tuple(axis_name([vector.x, vector.y, vector.z])
+                 for vector in (target.left_pointing_axis, target.right_pointing_axis))
+
+
+def common_tool_poses(buffer, frame, tools, tips=None):
+    """Current pose of each tool frame at a common instant. With `tips` (tool frame -> TipOffset), a tool
+    whose pose task controls an offset point gives the pose of that point instead."""
     latest = [buffer.lookup_transform(frame, tool, Time()) for tool in tools]
     stamps = [tf.header.stamp for tf in latest if tf.header.stamp.sec or tf.header.stamp.nanosec]
     stamp = min(stamps, key=lambda s: (s.sec, s.nanosec)) if stamps else None
-    return [pose_from_transform(buffer.lookup_transform(frame, tool, Time.from_msg(stamp)).transform)
-            if stamp is not None and tf.header.stamp != stamp and
-            (tf.header.stamp.sec or tf.header.stamp.nanosec) else pose_from_transform(tf.transform)
-            for tool, tf in zip(tools, latest)]
+    poses = [pose_from_transform(buffer.lookup_transform(frame, tool, Time.from_msg(stamp)).transform)
+             if stamp is not None and tf.header.stamp != stamp and
+             (tf.header.stamp.sec or tf.header.stamp.nanosec) else pose_from_transform(tf.transform)
+             for tool, tf in zip(tools, latest)]
+    return [tips[tool].apply(pose) if tips and tool in tips else pose for tool, pose in zip(tools, poses)]
 
 
 class MarkerSession:
     """Single-threaded target authority; also usable without the editor wire API."""
-    def __init__(self, node, buffer, target, changed=lambda state: None):
+    def __init__(self, node, buffer, target, changed=lambda state: None, tips=None):
         self.node, self.buffer, self.target, self.changed = node, buffer, target, changed
+        self.tips = tips if tips is not None else {}
         self.server = InteractiveMarkerServer(node, target.marker_namespace)
         self.frozen = None
         self.epoch = 0
@@ -102,11 +117,11 @@ class MarkerSession:
         swapped = self.target.bimanual and incoming.arm_names == old.arm_names[::-1] and \
             incoming.tool_frames == old.tool_frames[::-1] and incoming.frame_id == old.frame_id
         if read_tf:
-            poses = common_tool_poses(self.buffer, incoming.frame_id, incoming.tool_frames)
+            poses = common_tool_poses(self.buffer, incoming.frame_id, incoming.tool_frames, self.tips)
         elif swapped and old.tool_poses:
             poses = deepcopy(old.tool_poses[::-1])
         elif selection_changed and old.tool_poses:
-            poses = common_tool_poses(self.buffer, incoming.frame_id, incoming.tool_frames)
+            poses = common_tool_poses(self.buffer, incoming.frame_id, incoming.tool_frames, self.tips)
         elif incoming.tool_poses:
             if len(incoming.tool_poses) != (2 if old.bimanual else 1):
                 raise ValueError("Incomplete tool pose list")
@@ -117,12 +132,21 @@ class MarkerSession:
                 tf = self.buffer.lookup_transform(incoming.frame_id, old.frame_id, Time())
                 poses = [transform_pose(p, tf.transform) for p in poses]
         else:
-            poses = common_tool_poses(self.buffer, incoming.frame_id, incoming.tool_frames)
-        # A relative field edit anchors A; markers explicitly supply both poses.
-        if not read_tf and (not selection_changed or for_goal):
-            desired = normalized_pose(incoming.target_pose.pose)
-            poses = [poses[0], reconstruct_b(poses[0], desired)] if old.bimanual else [desired]
-        target = relative_pose(*poses) if old.bimanual else poses[0]
+            poses = common_tool_poses(self.buffer, incoming.frame_id, incoming.tool_frames, self.tips)
+        roll, distance = incoming.roll_angle, incoming.distance
+        if old.bimanual:
+            axes = pointing_names(incoming)
+            if math.isinf(roll) or not math.isfinite(distance) or distance < 0.0:
+                raise ValueError("Facing needs a finite or NaN roll and a positive distance")
+            # Capturing (or initializing) the target takes the measured geometry;
+            # numeric edits and goals keep the requested one.
+            if read_tf or (selection_changed and not for_goal) or distance == 0.0:
+                distance, measured = facing_measure(*poses, *axes)
+                roll = float('nan') if measured is None else measured
+            poses = list(facing_poses(*poses, *axes, roll=roll, distance=distance))
+        elif not read_tf and (not selection_changed or for_goal):
+            poses = [normalized_pose(incoming.target_pose.pose)]
+        target = pose_from_components([0, 0, 0], [0, 0, 0, 1]) if old.bimanual else poses[0]
         if incoming.marker_namespace != old.marker_namespace:
             replacement = InteractiveMarkerServer(self.node, incoming.marker_namespace)
             self.server.shutdown()
@@ -133,13 +157,18 @@ class MarkerSession:
         self.target.target_pose = PoseStamped()
         self.target.target_pose.header.frame_id = incoming.frame_id
         self.target.target_pose.pose = target
+        if old.bimanual:
+            self.target.roll_angle, self.target.distance = float(roll), float(distance)
         self.target.revision = old.revision
         self.target.locked, self.target.owner_id = False, ""
         self.target.goal_id = [0] * 16
         self.frozen = None
         if selection_changed or incoming.frame_id != old.frame_id:
             self.epoch += 1
-        self.publish("Relative planning target" if old.bimanual else "Absolute planning target")
+        tip_arms = [arm for arm, tool in zip(self.target.arm_names, self.target.tool_frames)
+                    if tool in self.tips and self.tips[tool].use]
+        self.publish(("Facing planning target" if old.bimanual else "Absolute planning target") +
+                     (f" — tip of {', '.join(tip_arms)}" if tip_arms else ""))
         self.render()
 
     def freeze(self, owner, action_name):
@@ -240,9 +269,22 @@ class MarkerSession:
             if feedback.marker_name != f'target_{self.epoch}_{index}' or feedback.header.frame_id != self.target.frame_id:
                 return
             poses = deepcopy(self.target.tool_poses)
+            previous = pose_components(poses[index])[1]
             poses[index] = normalized_pose(feedback.pose)
+            if self.target.bimanual:
+                axes = pointing_names(self.target)
+                rotated = any(abs(a - b) > 1e-6 for a, b in zip(previous, pose_components(poses[index])[1]))
+                roll = self.target.roll_angle
+                distance, _ = facing_measure(*poses, *axes)
+                if rotated:
+                    # The rotation about the line sets the roll; pointing snaps back.
+                    _, measured = facing_measure(*facing_poses(*poses, *axes), *axes)
+                    roll = roll if measured is None else measured
+                poses = list(facing_poses(*poses, *axes, roll=roll, distance=distance))
+                self.target.roll_angle, self.target.distance = float(roll), float(distance)
+            else:
+                self.target.target_pose.pose = poses[0]
             self.target.tool_poses = poses
-            self.target.target_pose.pose = relative_pose(*poses) if self.target.bimanual else poses[0]
             self.publish()
         except (ValueError, IndexError) as error:
             self.publish(str(error))
@@ -254,10 +296,11 @@ class MarkerSession:
         self.server.clear()
         if target.visible:
             for i, pose in enumerate(poses):
-                label = (("A" if i == 0 else "B") + " — " if target.bimanual else "Cartesian — ") + target.arm_names[i]
+                label = (("Left" if i == 0 else "Right") + " — " if target.bimanual else "Cartesian — ") + target.arm_names[i]
                 color = ((0.2, 0.8, 1.0) if i == 0 else (1.0, 0.55, 0.15)) if target.bimanual else (0.65, 0.35, 1.0)
+                tip = target.tool_frames[i] in self.tips and self.tips[target.tool_frames[i]].use
                 self.server.insert(gripper_marker(f'target_{self.epoch}_{i}', label, frame, pose, color,
-                                                  not target.locked), feedback_callback=self.feedback)
+                                                  not target.locked, tip=tip), feedback_callback=self.feedback)
         self.server.applyChanges()
 
     def close(self):
@@ -282,6 +325,15 @@ class PlanningMarkerNode(Node):
                  f'{robot}/{arm}/standard_jaws_tool'.lstrip('/')).value for arm in arms]
         if not arms:
             raise ValueError('Configure at least one arm')
+        # Controlled point of each arm's pose task (use_offset). Without these topics the markers only
+        # know the tool frame, as before.
+        self.tips = {}
+        max_age = self.declare_parameter('tip_offset_max_age', 1.0).value
+        for arm, tool in zip(arms, tools):
+            offset_topic = self.declare_parameter(f'arms.{arm}.pose_offset_topic', '').value
+            use_topic = self.declare_parameter(f'arms.{arm}.pose_use_offset_topic', '').value
+            if offset_topic and use_topic:
+                self.tips[tool] = TipOffset(self, tool, offset_topic, use_topic, max_age, self.tip_changed)
         qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL, reliability=ReliabilityPolicy.RELIABLE)
         self.marker_state_type = PlanningTargetState
         self.edit_type = UpdatePlanningTarget
@@ -299,13 +351,24 @@ class PlanningMarkerNode(Node):
             endpoint = f'{prefix}/manipulation/planning_targets/{mode}'
             publisher = self.create_publisher(PlanningTargetState, endpoint + '/state', qos)
             session = MarkerSession(self, self.buffer, target,
-                changed=lambda state, pub=publisher: pub.publish(state.message(PlanningTargetState)))
+                changed=lambda state, pub=publisher: pub.publish(state.message(PlanningTargetState)),
+                tips=self.tips)
             self.sessions.append(session)
             self.state_publishers.append(publisher)
             self.editor_services.append(self.create_service(UpdatePlanningTarget, endpoint + '/update',
                 lambda req, res, s=session: self.update_target(s, req, res)))
             session.publish()
         self.watchdog = self.create_timer(0.5, self.tick, clock=Clock(clock_type=ClockType.STEADY_TIME))
+
+    def tip_changed(self, tip):
+        """The pose task of an arm switched between its tool and its offset point: show and read the
+        pose of the new point (a reserved target is left as it is)."""
+        for session in self.sessions:
+            if tip.tool_frame in session.target.tool_frames and not session.target.locked:
+                try:
+                    session.edit(deepcopy(session.target), read_tf=True)
+                except (ValueError, TransformException) as error:
+                    session.publish(str(error))
 
     def update_target(self, session, request, response):
         operation, target = request.operation, session.target

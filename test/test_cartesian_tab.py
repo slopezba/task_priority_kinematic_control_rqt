@@ -205,6 +205,18 @@ class CartesianTabTest(unittest.TestCase):
         self.assertFalse(self.tab.nominal_checkbox.isEnabled())
         self.assertFalse(self.tab._goal_from_fields().optimize_trajectory_nominal)
 
+    def test_predictive_planner_is_selected_per_goal(self):
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("pose"))
+        self.assertFalse(self.tab.predictive_checkbox.isEnabled())
+        self.tab.nominal_checkbox.setChecked(True)
+        self.assertTrue(self.tab.predictive_checkbox.isEnabled())
+        self.assertFalse(self.tab._goal_from_fields().use_predictive_local_planner)
+        self.tab.predictive_checkbox.setChecked(True)
+        self.assertTrue(self.tab._goal_from_fields().use_predictive_local_planner)
+        self.tab.posture_checkbox.setChecked(True)
+        self.assertFalse(self.tab.predictive_checkbox.isChecked())
+        self.assertFalse(self.tab._goal_from_fields().use_predictive_local_planner)
+
     def test_stpik_control_is_disabled_for_explicit_non_pose_backends(self):
         self.tab.use_stpik_checkbox.setChecked(False)
         for backend in ("task", "controller"):

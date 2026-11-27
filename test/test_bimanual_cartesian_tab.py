@@ -103,25 +103,30 @@ class CartesianTabTest(unittest.TestCase):
         result.joint_trajectory.points = [point]
         handle.result.set_result(SimpleNamespace(status=status, result=result))
 
-    def test_goal_preserves_zero_constraints_and_normalizes_orientation(self):
-        self.tab.xyz_edit.setText("0.1,-0.2,0.3")
-        self.tab.quaternion_edit.setText("0,0,0,2")
-        for spin in self.tab.position_tolerances + self.tab.orientation_tolerances:
+    def test_goal_preserves_zero_constraints_and_sends_the_facing_target(self):
+        self.tab.left_axis_combo.setCurrentText("-z")
+        self.tab.right_axis_combo.setCurrentText("+y")
+        self.tab.distance_spin.setValue(0.42)
+        for spin in (self.tab.pointing_tolerance_spin, self.tab.roll_tolerance_spin,
+                     self.tab.distance_tolerance_spin):
             spin.setValue(0.0)
         goal = self.tab._goal_from_fields()
-        self.assertEqual((goal.arm_a, goal.arm_b), ("arm_a", "arm_b"))
-        self.assertEqual(goal.relative_target.header.frame_id, "robot_base")
-        self.assertEqual(goal.relative_target.pose.position.y, -0.2)
-        self.assertEqual(goal.relative_target.pose.orientation.w, 1.0)
-        self.assertFalse(hasattr(self.tab, "radius_spin"))
-        self.assertFalse(hasattr(self.tab, "arm_a_angles"))
-        self.assertEqual(goal.relative_position_tolerance.x, 0.0)
-        self.assertEqual(goal.relative_orientation_tolerance.y, 0.0)
+        self.assertEqual((goal.left_pointing_axis.z, goal.right_pointing_axis.y), (-1.0, 1.0))
+        self.assertAlmostEqual(goal.roll_angle, math.pi)
+        self.tab.roll_edit.setText("")
+        self.assertTrue(math.isnan(self.tab._goal_from_fields().roll_angle))
+        self.assertEqual(goal.distance, 0.42)
+        self.assertEqual((goal.pointing_tolerance, goal.roll_tolerance, goal.distance_tolerance),
+                         (0.0, 0.0, 0.0))
         self.assertEqual(goal.cartesian_step, 0.005)
         self.assertEqual(goal.planning_time, 10.0)
-        self.assertEqual(goal.velocity_scaling, 0.0)
-        self.assertEqual(goal.acceleration_scaling, 0.0)
+        self.assertEqual(goal.velocity_scaling, 0.1)
+        self.assertEqual(goal.acceleration_scaling, 0.05)
+        self.assertEqual(goal.facing_orientation_fraction, 0.4)
+        self.assertEqual(goal.execution_backend, "facing")
         self.assertFalse(goal.execute)
+        self.tab.roll_edit.setText("0.5")
+        self.assertEqual(self.tab._goal_from_fields().roll_angle, 0.5)
 
     def test_speed_factors_are_sent_and_locked_with_pending_plan(self):
         self.tab.velocity_scaling_spin.setValue(0.05)
@@ -141,7 +146,9 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(self.tab.velocity_scaling_spin.minimum(), 0.0)
         self.assertEqual(self.tab.velocity_scaling_spin.maximum(), 1.0)
         self.assertEqual(self.tab.acceleration_scaling_spin.maximum(), 1.0)
+        self.tab.velocity_scaling_spin.setValue(0.0)
         self.assertEqual(self.tab.velocity_scaling_spin.text(), "Server default")
+        self.tab.acceleration_scaling_spin.setValue(0.0)
         self.tab.velocity_scaling_spin.setValue(1.0)
         goal = self.tab._goal_from_fields()
         self.assertEqual(goal.velocity_scaling, 1.0)
@@ -152,80 +159,86 @@ class CartesianTabTest(unittest.TestCase):
         self.assertEqual(goal.velocity_scaling, 0.0)
         self.assertEqual(goal.acceleration_scaling, 0.05)
 
-    def test_custom_arms_frames_and_action_endpoint_are_used(self):
-        self.tab.arm_a_combo.setEditText("different_arm_a")
-        self.tab.arm_b_combo.setEditText("different_arm_b")
-        self.tab.arm_a_tip_edit.setText("new_arm_a_tool")
-        self.tab.reference_frame_edit.setText("other_robot/base")
+    def test_custom_action_endpoint_and_facing_backend_are_used(self):
         self.tab.action_edit.setText("/other_robot/cartesian_plan")
         self.tab.execute_checkbox.setChecked(True)
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("facing"))
         self.tab.send_button.click()
         module.ActionClient.assert_called_once_with(
             self.node, PlanBimanualCartesianTrajectory, "/other_robot/cartesian_plan")
         goal = self.client.send_goal_async.call_args.args[0]
-        self.assertEqual(goal.arm_a, "different_arm_a")
-        self.assertEqual(goal.relative_target.header.frame_id, "other_robot/base")
+        self.assertEqual(goal.execution_backend, "facing")
         self.assertTrue(goal.execute)
         self.node.create_client.assert_not_called()
 
+    def test_whole_trajectory_optimization_requires_the_facing_backend(self):
+        self.tab.optimize_checkbox.setChecked(True)
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("controller"))
+        with self.assertRaises(ValueError):
+            self.tab._goal_from_fields()
+        self.tab.backend_combo.setCurrentIndex(self.tab.backend_combo.findData("facing"))
+        self.assertTrue(self.tab._goal_from_fields().optimize_trajectory_nominal)
+
+    def test_default_pointing_axes(self):
+        goal = self.tab._goal_from_fields()
+        self.assertEqual((goal.left_pointing_axis.z, goal.right_pointing_axis.z), (1.0, -1.0))
+
+    def test_orientation_fraction_can_be_edited_or_left_to_the_server(self):
+        spin = self.tab.orientation_fraction_spin
+        self.assertEqual(spin.value(), 0.4)
+        spin.setValue(spin.minimum())
+        self.assertEqual(spin.text(), "Server default")
+        self.assertEqual(self.tab._goal_from_fields().facing_orientation_fraction, -1.0)
+        for value in (0.0, 0.7):
+            spin.setValue(value)
+            self.assertAlmostEqual(self.tab._goal_from_fields().facing_orientation_fraction, value)
+        spin.setValue(1.0)
+        self.assertEqual(spin.value(), 0.99)
+        handle = self.send_and_accept()
+        self.assertFalse(spin.isEnabled())
+        self.complete(handle)
+        self.assertTrue(spin.isEnabled())
+
     def test_invalid_input_never_creates_action_client(self):
-        for text in ("nan,0,0", "1,2", "1,inf,3", "not a number"):
-            self.tab.xyz_edit.setText(text)
+        for text in ("inf", "not a number"):
+            self.tab.roll_edit.setText(text)
             self.tab.send_button.click()
             self.assertIn("Error:", self.tab.result_label.text())
-        self.tab.xyz_edit.setText("0,0,0")
-        self.tab.quaternion_edit.setText("0,0,0,0")
+        self.tab.roll_edit.setText("")
+        self.tab.distance_spin.setValue(0.0)
         self.tab.send_button.click()
-        self.tab.quaternion_edit.setText("0,0,0,1")
-        self.tab.arm_b_combo.setEditText("arm_a")
-        self.tab.send_button.click()
+        self.assertIn("Error:", self.tab.result_label.text())
         module.ActionClient.assert_not_called()
         self.assertTrue(self.tab.send_button.isEnabled())
 
-    def test_current_relative_pose_reads_both_tools_in_base_at_same_time(self):
-        arm_a = TransformStamped()
-        arm_a.header.stamp.sec = 42
-        arm_a.transform.translation.x = 0.2
-        arm_a.transform.rotation.z = math.sin(math.pi / 4)
-        arm_a.transform.rotation.w = math.cos(math.pi / 4)
-        arm_b = TransformStamped()
-        arm_b.transform.translation.x = 0.62
-        arm_b.transform.translation.z = -0.03
-        arm_b.transform.rotation.w = 1.0
-        self.buffer.lookup_transform.side_effect = [arm_a, arm_b]
+    def test_current_facing_reads_distance_and_roll_at_the_same_time(self):
+        left = TransformStamped()
+        left.header.stamp.sec = 42
+        left.transform.translation.x = 0.2
+        left.transform.rotation.w = 1.0
+        right = TransformStamped()
+        right.transform.translation.x = 0.62
+        # Half turn about z: its +x points back at the left tool.
+        right.transform.rotation.z = 1.0
+        right.transform.rotation.w = 0.0
+        self.tab.left_axis_combo.setCurrentText("+x")
+        self.tab.right_axis_combo.setCurrentText("+x")
+        self.buffer.lookup_transform.side_effect = [left, right]
         self.tab.read_pose_button.click()
         calls = self.buffer.lookup_transform.call_args_list
         self.assertEqual(calls[0].args[:2], ("robot_base", "tool_a"))
         self.assertEqual(calls[1].args[:2], ("robot_base", "tool_b"))
         self.assertEqual(calls[1].args[2].nanoseconds, 42_000_000_000)
-        actual = module.numeric_vector(self.tab.xyz_edit.text(), 3, "XYZ")
-        for value, expected in zip(actual, (0.42, 0.0, -0.03)):
-            self.assertAlmostEqual(value, expected)
-        quaternion = module.numeric_vector(self.tab.quaternion_edit.text(), 4, "Quaternion")
-        self.assertAlmostEqual(quaternion[2], -math.sin(math.pi / 4))
-        self.assertAlmostEqual(quaternion[3], math.cos(math.pi / 4))
+        self.assertAlmostEqual(self.tab.distance_spin.value(), 0.42)
+        # Reference axes are +y on both tools, which are opposite.
+        self.assertAlmostEqual(abs(float(self.tab.roll_edit.text())), math.pi)
         module.ActionClient.assert_not_called()
 
-    def test_swapping_roles_keeps_reference_and_inverts_relative_components(self):
-        arm_a = TransformStamped().transform
-        arm_b = TransformStamped().transform
-        arm_a.rotation.y, arm_a.rotation.w = math.sin(0.3), math.cos(0.3)
-        arm_b.rotation.x, arm_b.rotation.w = math.sin(-0.2), math.cos(-0.2)
-        arm_b.translation.x = 0.5
-        first_p, first_q = module.relative_pose_components(arm_a, arm_b)
-        swapped_p, swapped_q = module.relative_pose_components(arm_b, arm_a)
-        self.assertEqual(swapped_p, [-value for value in first_p])
-        for value, expected in zip(swapped_q, [-first_q[0], -first_q[1], -first_q[2], first_q[3]]):
-            self.assertAlmostEqual(value, expected)
-        self.tab.arm_a_combo.setEditText("arm_b")
-        self.tab.arm_b_combo.setEditText("arm_a")
-        self.assertEqual(self.tab._goal_from_fields().relative_target.header.frame_id, "robot_base")
-
     def test_tf_failure_does_not_change_target_or_send_goal(self):
-        self.tab.xyz_edit.setText("1,2,3")
+        self.tab.distance_spin.setValue(0.7)
         self.buffer.lookup_transform.side_effect = module.TransformException("missing TF")
         self.tab.read_pose_button.click()
-        self.assertEqual(self.tab.xyz_edit.text(), "1,2,3")
+        self.assertEqual(self.tab.distance_spin.value(), 0.7)
         self.assertIn("TF is unavailable", self.tab.result_label.text())
         module.ActionClient.assert_not_called()
 

@@ -104,6 +104,9 @@ class CartesianTab(BimanualCartesianTab):
             "the low-priority robot_nominal task while executing. It optimizes the initial "
             "posture itself, so it excludes 'Optimize initial posture'. Requires STPIK.")
         self.nominal_checkbox.toggled.connect(self._nominal_changed)
+        self.predictive_checkbox = QCheckBox("Use Predictive Local Planner")
+        self.predictive_checkbox.setToolTip(
+            "Use predictive recovery for this goal. Requires Pose and whole-trajectory optimization.")
         self.use_stpik_checkbox = QCheckBox("Use STPIK")
         self.use_stpik_checkbox.setChecked(True)
         self.use_stpik_checkbox.setToolTip(
@@ -178,6 +181,7 @@ class CartesianTab(BimanualCartesianTab):
         form.addRow("Goal Time Tolerance [s]", self.goal_time_spin)
         form.addRow(self.posture_checkbox)
         form.addRow(self.nominal_checkbox)
+        form.addRow(self.predictive_checkbox)
         form.addRow(self.use_stpik_checkbox)
         form.addRow(self.execute_checkbox)
         self.read_pose_button = QPushButton("Read Current Pose (TF)")
@@ -216,6 +220,7 @@ class CartesianTab(BimanualCartesianTab):
                         self.xyz_edit, self.quaternion_edit, self.step_spin, self.planning_time_spin,
                         self.velocity_scaling_spin, self.acceleration_scaling_spin,
                         self.execute_checkbox, self.use_stpik_checkbox, self.posture_checkbox, self.nominal_checkbox,
+                        self.predictive_checkbox,
                         self.read_pose_button, self.base_bounds_checkbox,
                         self.refresh_joints_button, self.goal_time_spin,
                         *self.position_tolerances, *self.orientation_tolerances,
@@ -382,6 +387,8 @@ class CartesianTab(BimanualCartesianTab):
         if checked:
             self.posture_checkbox.setChecked(False)
             self.use_stpik_checkbox.setChecked(True)
+        else:
+            self.predictive_checkbox.setChecked(False)
         self._update_controls()
 
     def _goal_from_fields(self):
@@ -442,6 +449,8 @@ class CartesianTab(BimanualCartesianTab):
         goal.optimize_trajectory_nominal = pose_mode and self.nominal_checkbox.isChecked()
         goal.optimize_initial_posture = (pose_mode and self.posture_checkbox.isChecked()
                                          and not goal.optimize_trajectory_nominal)
+        goal.use_predictive_local_planner = (goal.optimize_trajectory_nominal
+                                             and self.predictive_checkbox.isChecked())
         goal.use_stpik = self.use_stpik_checkbox.isChecked()
         return goal
 
@@ -456,6 +465,7 @@ class CartesianTab(BimanualCartesianTab):
         pose_mode = self.backend_combo.currentData() == "pose"
         self.nominal_checkbox.setEnabled(editable and pose_mode)
         self.posture_checkbox.setEnabled(editable and pose_mode)
+        self.predictive_checkbox.setEnabled(editable and pose_mode and self.nominal_checkbox.isChecked())
         optimizing = self.posture_checkbox.isChecked() or self.nominal_checkbox.isChecked()
         self.use_stpik_checkbox.setEnabled(editable and self.backend_combo.currentData() in ("", "pose")
                                            and not (pose_mode and optimizing))

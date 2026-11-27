@@ -11,7 +11,7 @@ ROS 2 RQT plugin for monitoring and interacting with the task-priority kinematic
 - Runtime target publication for supported tasks
 - Cartesian planning of the selected arm and optional vehicle DOFs, with TF
   target frames, per-goal limits and trajectory tracking tolerances
-- Bimanual Cartesian planning with relative-pose input, per-joint movement weights,
+- Bimanual end-effectors facing planning, per-joint movement weights,
   progress feedback, explicit pending-plan execution, and cancellation
 
 Drag the horizontal divider between the task table and tabs to change their
@@ -168,14 +168,13 @@ controls visibility. Disabling it also enables the existing manual goal path,
 which can be used without the marker node.
 
 Use RViz's **Interact** tool to drag targets. **Cartesian** has one purple pin;
-**Bimanual Cartesian** has blue A and orange B pins. Field edits are acknowledged
-by the node; marker dragging publishes updated state back to RQT. The bimanual
-markers define only `pB-pA` and `RB*RA^T` in the configured reference frame. Their
-absolute positions are illustrative, and the base is fixed. Editing the relative
-fields anchors A and reconstructs B; swapping roles preserves physical tool poses.
-**Read Current Pose / Read Relative Pose** asks the node to obtain a common TF
-snapshot. Missing TF retains the last valid target. The services exist and answer
-even before TF is ready (RViz initially receives an empty marker list).
+**Bimanual Cartesian** has blue left and orange right pins. They describe the
+facing target: both tools always point at each other, dragging them sets the
+distance and rotating one about the line sets the roll. Their absolute positions
+are illustrative, and the base is fixed. Editing distance or roll keeps the left
+position. **Read Current Pose / Read Current Facing** asks the node to obtain a
+common TF snapshot. Missing TF retains the last valid target. The services exist
+and answer even before TF is ready (RViz initially receives an empty marker list).
 The rings and arrows use a scale of `0.10`, matching the configured `left_pose`
 marker. Gripper meshes include the inverse of the Alpha `standard_jaws_tool`
 fixed joint so their orientation and position match the robot when reading TF.
@@ -198,7 +197,7 @@ commands or alters a pending plan in the planner.
 
 The new `sura_manipulation_actions/msg/PlanningTargetState` is published with reliable,
 transient-local depth-one QoS at the corresponding `/state` endpoint. It includes
-poses, relative/absolute target, configuration, revision, server instance ID and
+poses, facing/absolute target, configuration, revision, server instance ID and
 reservation state. `UpdatePlanningTarget` supports EDIT, READ_TF, LOCK, RELEASE,
 BIND_GOAL and HEARTBEAT. Revision checks prevent stale edits overwriting a newer
 marker drag; server instance IDs handle node restarts. These new interfaces require
@@ -223,28 +222,20 @@ ros2 launch sura_manipulation_actions manipulation_actions.launch.py \
   execution_backend:=controller use_rviz:=true
 ```
 
-Choose arm A and arm B; neither has priority in the planner. **Read Relative Pose (TF)** reads both tool poses
-in **Relative Reference Frame**, at a common timestamp, and fills XYZ with
-`p_arm_b - p_arm_a`, and the quaternion with `R_arm_b * R_arm_a^T`.
-Both are expressed in reference/base axes. Editing X by `0.01` requests one
-centimetre more separation along base X even if arm A is rotated.
-Identity quaternion requests equal tool orientations. This is a relative
-relationship, not arm B's absolute pose.
+Choose the **Left/Right Pointing Axis** of each tool, the **Roll** around the
+line from the left tool to the right one (empty keeps the measured roll) and the
+**Distance** between them. **Read Current Facing (TF)** fills roll and distance
+from both tool poses at a common timestamp. The left and right arms are fixed by
+the planner YAML; tool frames must match the configured tips.
 
-The reference must match `relative_reference_frame` in the planner (a model
-link independent of the commanded arms); it defaults to `cirtesub/base_link`.
-Tool frames must match the configured tips and are used for TF reading.
-Arm names, reference/tool frames, action and execute-service endpoints remain
-editable for other robots. Defaults are read from the installed planner YAML.
-
-The Alpha example uses `cirtesub/alpha_left/standard_jaws_tool` and
-`cirtesub/alpha_right/standard_jaws_tool`. Selecting either arm selects its
-corresponding tool frame; the reference/base frame stays the same when A/B are
-swapped. Read the pose again after swapping to obtain the reversed relationship.
-
-Set relative position/orientation tolerances per component. Zero is a strict constraint.
-Quaternions are entered as XYZW and normalized before sending. Zero planning
-time or Cartesian step selects the server's configured default.
+Pointing, roll and distance tolerances apply along the whole path; zero is a
+strict constraint. Zero planning time or Cartesian step selects the server default.
+**Optimize whole trajectory (robot_nominal)** plans the whole facing trajectory in
+the controller with the Task Priority hierarchy, as the single-arm nominal mode does.
+It requires the Facing backend and the facing task selection already at planning time.
+The **Facing** backend streams the facing reference to `EndEffectors_Facing` and
+the arm joints to `robot_nominal` with the base masked; see the planner guide for
+the required task selection.
 
 **Velocity Scaling** and **Acceleration Scaling** select the joint limit factors
 for each goal: `0.1` is 10 %, `0.05` is 5 %. Zero displays **Server default** and
@@ -253,14 +244,12 @@ change the timing shown in RViz and sent to either backend; **Planning Time**
 is only the computation budget. Inputs are locked while a goal is active:
 cancel the active goal, choose new factors and send another goal to change speed.
 Configure joint movement penalties in the server YAML with `planning.weights`.
-In Alpha the order is left b,c,d,e, then right b,c,d,e. A larger value discourages
+In Alpha the order is left e,d,c,b, then right e,d,c,b. A larger value discourages
 moving that joint away from its measured initial position; zero adds no penalty
-and does not lock it. Weights stay on the same joints when A/B are swapped.
+and does not lock it.
 Restart the server after editing its YAML and configure it again, or use cleanup,
 update the ROS parameter and configure. This discards any pending plan.
-The action now uses `arm_a`/`arm_b` and `arm_a_path`/`arm_b_path`, and has no arm
-radius/orientation fields. Rebuild the action and RQT packages and restart clients
-to use this interface.
+Rebuild the action and RQT packages and restart clients to use this interface.
 
 **Send Goal** plans and publishes the robot trajectory in RViz. Execution is
 unchecked by default: the goal remains in `waiting_for_execute`. Review the plan
@@ -292,3 +281,22 @@ Build it inside a ROS 2 workspace with `colcon`.
 ## Notes
 
 This repository is intended to contain the `task_priority_kinematic_control_rqt` package only.
+
+## Punta controlada (`use_offset`) en el marker de planificación
+
+Si la tarea de pose de un brazo tiene `use_offset: true` en el controlador (ver `task_priority_kinematic_control`),
+el servidor del marker de planificación (`planning_marker_server`) trabaja con el **punto controlado** de ese brazo
+(p. ej. la punta de una brida) y no con `standard_jaws_tool`:
+
+- **Read Current Pose (TF)** y el valor inicial del marker son la pose de la punta (`T_tool · T_tool→punta`).
+- En lugar de las mallas de la pinza se dibuja un **frame de ejes** (x rojo, y verde, z azul); sigue siendo
+  arrastrable en los seis ejes y la descripción añade `(tip)`.
+- Al activar o desactivar `use_offset` el marker se vuelve a leer en el nuevo punto (un objetivo ya reservado
+  no se mueve). Si `use_offset` está activo y no llega un offset reciente (más viejo que `tip_offset_max_age`,
+  1 s), la lectura falla con un mensaje; nunca cae al tool en silencio.
+
+El servidor lee, por brazo, `arms.<arm>.pose_offset_topic` (`PoseStamped` en el frame del tool) y
+`arms.<arm>.pose_use_offset_topic` (`std_msgs/Bool`, `transient_local`). `manipulation_actions.launch.py` los
+deriva de `arms.<arm>.pose_target_topic`; sin ellos el marker se comporta como antes. Con "Show markers"
+desactivado, la pestaña lee la pose del tool por TF directamente (no conoce el offset).
+

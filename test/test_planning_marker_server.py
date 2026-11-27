@@ -23,12 +23,13 @@ from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
-from visualization_msgs.msg import InteractiveMarkerFeedback
+from visualization_msgs.msg import InteractiveMarkerFeedback, Marker
 from visualization_msgs.srv import GetInteractiveMarkers
 
 from task_priority_kinematic_control_rqt.marker_geometry import (
-    pose_components, pose_from_components, reconstruct_b, relative_pose, transform_pose,
+    compose_pose, facing_measure, facing_poses, pose_components, pose_from_components, transform_pose,
 )
+from task_priority_kinematic_control_rqt.tip_offset import TipOffset
 from task_priority_kinematic_control_rqt.planning_marker_node import MarkerSession, PlanningMarkerNode, Target
 
 
@@ -51,7 +52,12 @@ def initial_target(bimanual=False):
                     arm_names=['left', 'right'] if bimanual else ['left'],
                     tool_frames=['left_tip', 'right_tip'] if bimanual else ['left_tip'], tool_poses=poses)
     target.target_pose.header.frame_id = target.frame_id
-    target.target_pose.pose = relative_pose(*poses) if bimanual else poses[0]
+    if bimanual:
+        target.distance, target.roll_angle = facing_measure(*poses, '+x', '+x')
+        target.tool_poses = list(facing_poses(*poses, '+x', '+x', target.roll_angle, target.distance))
+        target.target_pose.pose = pose_from_components([0, 0, 0], [0, 0, 0, 1])
+    else:
+        target.target_pose.pose = poses[0]
     return target
 
 
@@ -130,49 +136,74 @@ class SessionTest(unittest.TestCase):
                     transforms[tool] = tf
                 self.buffer.lookup_transform.side_effect = lambda frame, tool, stamp: transforms[tool]
                 self.assertTrue(self.operation(session, Request.READ_TF).success)
-                self.assertEqual(session.target.tool_poses, tools)
-                expected = relative_pose(*tools) if bimanual else tools[0]
-                self.assertEqual(session.target.target_pose.pose, expected)
+                if bimanual:
+                    # Capture keeps the measured distance and roll, then shows them facing.
+                    distance, roll = facing_measure(*tools, '+x', '+x')
+                    self.assertAlmostEqual(session.target.distance, distance)
+                    self.assertAlmostEqual(session.target.roll_angle, roll)
+                    tools = session.target.tool_poses
+                else:
+                    self.assertEqual(session.target.tool_poses, tools)
+                    self.assertEqual(session.target.target_pose.pose, tools[0])
                 response = session.server.getInteractiveMarkersCallback(None, GetInteractiveMarkers.Response())
                 for marker in response.markers:
                     i = int(marker.name.rsplit('_', 1)[1])
                     self.assertEqual(marker.pose, tools[i])
+                    if bimanual:
+                        continue
                     for mesh, mesh_in_base in zip(marker.controls[0].markers, meshes_in_base):
                         actual = transform_pose(mesh.pose, transforms[session.target.tool_frames[i]].transform)
                         expected = transform_pose(mesh_in_base, bases[i].transform)
                         for got, want in zip(sum(pose_components(actual), []), sum(pose_components(expected), [])):
                             self.assertAlmostEqual(got, want)
 
-    def test_relative_marker_drag_and_numeric_edit_use_reference_axes(self):
+    def assert_facing(self, target):
+        distance, roll = facing_measure(*target.tool_poses, '+x', '+x')
+        self.assertAlmostEqual(distance, target.distance)
+        if math.isfinite(target.roll_angle):
+            self.assertAlmostEqual(math.sin(roll - target.roll_angle), 0.0)
+        # Each tool x axis points at the other tool.
+        a, b = [pose_components(p)[0] for p in target.tool_poses]
+        for pose, direction in zip(target.tool_poses, ([y - x for x, y in zip(a, b)],
+                                                       [x - y for x, y in zip(a, b)])):
+            tip = pose_components(compose_pose(pose, pose_from_components([distance, 0, 0], [0, 0, 0, 1])))[0]
+            origin = pose_components(pose)[0]
+            for got, want in zip([t - o for t, o in zip(tip, origin)], direction):
+                self.assertAlmostEqual(got, want)
+
+    def test_facing_marker_drag_and_numeric_edit_keep_tools_facing(self):
         session = self.session(True)
-        target = session.target
-        for got, expected in zip(pose_components(target.target_pose.pose)[1], [0.5, 0.5, -0.5, 0.5]):
-            self.assertAlmostEqual(got, expected)
+        self.assert_facing(session.target)
         feedback = InteractiveMarkerFeedback()
         feedback.marker_name = f'target_{session.epoch}_1'
         feedback.header.frame_id = 'base'
         feedback.event_type = InteractiveMarkerFeedback.POSE_UPDATE
-        feedback.pose = deepcopy(target.tool_poses[1])
+        feedback.pose = deepcopy(session.target.tool_poses[1])
         feedback.pose.position.x += 0.1
+        roll = session.target.roll_angle
         session.feedback(feedback)
-        self.assertAlmostEqual(target.target_pose.pose.position.x, 0.6)
-        before = deepcopy(target.tool_poses[0])
-        edit = deepcopy(target)
-        edit.target_pose.pose = pose_from_components([0.4, 0.2, -0.1], [0, 0, 0, 2])
-        self.assertTrue(self.operation(session, Request.EDIT, edit).success)
-        self.assertEqual(session.target.tool_poses[0], before)
-        for got, expected in zip(pose_components(session.target.tool_poses[1])[0], [0.6, 0.3, -0.1]):
-            self.assertAlmostEqual(got, expected)
-
-    def test_swap_roles_preserves_physical_poses(self):
-        session = self.session(True)
-        old = deepcopy(session.target.tool_poses)
+        self.assertAlmostEqual(session.target.roll_angle, roll)
+        self.assert_facing(session.target)
+        left = pose_components(session.target.tool_poses[0])[0]
         edit = deepcopy(session.target)
-        edit.arm_names.reverse()
-        edit.tool_frames.reverse()
+        edit.distance, edit.roll_angle = 0.4, 0.3
         self.assertTrue(self.operation(session, Request.EDIT, edit).success)
-        self.assertEqual(session.target.tool_poses, old[::-1])
-        self.assertAlmostEqual(session.target.target_pose.pose.position.x, -0.5)
+        self.assertEqual((session.target.distance, session.target.roll_angle), (0.4, 0.3))
+        for got, want in zip(pose_components(session.target.tool_poses[0])[0], left):
+            self.assertAlmostEqual(got, want)
+        self.assert_facing(session.target)
+
+    def test_facing_target_keeps_nan_roll_and_rejects_invalid_axes(self):
+        session = self.session(True)
+        edit = deepcopy(session.target)
+        edit.roll_angle = float('nan')
+        self.assertTrue(self.operation(session, Request.EDIT, edit).success)
+        self.assertTrue(math.isnan(session.target.roll_angle))
+        edit = deepcopy(session.target)
+        edit.left_pointing_axis.y = 1.0
+        response = self.operation(session, Request.EDIT, edit)
+        self.assertFalse(response.success)
+        self.assertIn('pure signed', response.message)
 
     def test_invalid_edit_and_stale_revision_do_not_replace_target(self):
         session = self.session()
@@ -314,6 +345,132 @@ class SessionTest(unittest.TestCase):
         schema = Path(__file__).resolve().parents[2] / 'sura_manipulation_actions/msg/PlanningTargetState.msg'
         names = {line.split()[1] for line in schema.read_text().splitlines() if line and not line.startswith('#')}
         self.assertEqual(names, {f.name for f in fields(Target)})
+
+
+def offset_message(tool, z=0.2, frame=None):
+    from geometry_msgs.msg import PoseStamped
+    message = PoseStamped()
+    message.header.frame_id = tool if frame is None else frame
+    message.pose.position.z = z
+    message.pose.orientation.w = 1.0
+    return message
+
+
+class TipOffsetTest(unittest.TestCase):
+    """The pose task controls an offset point (use_offset): read/draw the pose of that point."""
+    def setUp(self):
+        self.node, self.buffer = MagicMock(), MagicMock()
+        self.node.get_clock.return_value.now.return_value = Time(seconds=42)
+        tf = TransformStamped()
+        tf.header.stamp.sec = 40
+        tf.transform.translation.x = 0.5
+        tf.transform.rotation.w = 1.0
+        self.buffer.lookup_transform.return_value = tf
+        self.sessions, self.changes = [], []
+        self.tip = TipOffset(self.node, 'left_tip', '/t/offset', '/t/use_offset', 1.0,
+                             on_change=self.changes.append)
+
+    def tearDown(self):
+        for session in self.sessions:
+            session.close()
+
+    def session(self):
+        session = MarkerSession(self.node, self.buffer, initial_target(), tips={'left_tip': self.tip})
+        self.sessions.append(session)
+        return session
+
+    def read(self, session):
+        request = Request()
+        request.operation, request.client_id = Request.READ_TF, 'editor'
+        request.expected_revision, request.target = session.target.revision, deepcopy(session.target)
+        response = SimpleNamespace(success=False, message='', state=None)
+        host = SimpleNamespace(edit_type=API, marker_state_type=Target)
+        return PlanningMarkerNode.update_target(host, session, request, response)
+
+    def visual(self, session):
+        response = session.server.getInteractiveMarkersCallback(None, GetInteractiveMarkers.Response())
+        return response.markers[0].controls[0]
+
+    def test_compose_pose_applies_the_offset_in_the_poses_own_axes(self):
+        a = pose_from_components([1, 0, 0], [0, 0, math.sqrt(0.5), math.sqrt(0.5)])  # yawed 90 degrees
+        b = pose_from_components([0.2, 0, 0], [0, 0, 0, 1])
+        position, quaternion = pose_components(compose_pose(a, b))
+        for got, want in zip(position + quaternion, [1, 0.2, 0, 0, 0, math.sqrt(0.5), math.sqrt(0.5)]):
+            self.assertAlmostEqual(got, want)
+
+    def test_offset_messages_are_validated_like_the_controller_does(self):
+        self.tip._offset_received(offset_message('left_tip', frame='other_frame'))
+        self.assertIsNone(self.tip.pose)
+        bad = offset_message('left_tip')
+        bad.pose.orientation.w = 0.0
+        self.tip._offset_received(bad)
+        self.assertIsNone(self.tip.pose)
+        self.tip._offset_received(offset_message(''))  # an empty frame means the task frame
+        self.assertIsNotNone(self.tip.pose)
+
+    def test_without_use_offset_the_tool_pose_and_the_gripper_are_kept(self):
+        session = self.session()
+        self.tip._offset_received(offset_message('left_tip'))
+        self.assertTrue(self.read(session).success)
+        self.assertAlmostEqual(session.target.tool_poses[0].position.z, 0.0)
+        self.assertEqual(self.visual(session).name, 'gripper')
+        self.assertEqual(len(self.visual(session).markers), 3)
+
+    def test_with_use_offset_reads_the_tip_and_draws_a_frame_instead_of_the_gripper(self):
+        session = self.session()
+        self.tip._offset_received(offset_message('left_tip'))
+        self.tip._use_received(SimpleNamespace(data=True))
+        response = self.read(session)
+        self.assertTrue(response.success, response.message)
+        pose = session.target.tool_poses[0]
+        self.assertAlmostEqual(pose.position.x, 0.5)
+        self.assertAlmostEqual(pose.position.z, 0.2)  # tool pose composed with the offset
+        self.assertEqual(session.target.target_pose.pose, pose)
+        self.assertIn('tip', response.message)
+        visual = self.visual(session)
+        self.assertEqual(visual.name, 'frame')
+        self.assertEqual([m.type for m in visual.markers], [Marker.ARROW] * 3)
+        response = session.server.getInteractiveMarkersCallback(None, GetInteractiveMarkers.Response())
+        self.assertEqual(len(response.markers[0].controls), 7)  # still draggable on 6 axes
+
+    def test_use_offset_without_a_fresh_offset_does_not_fall_back_to_the_tool(self):
+        session = self.session()
+        self.tip._use_received(SimpleNamespace(data=True))
+        response = self.read(session)
+        self.assertFalse(response.success)
+        self.assertIn('no offset has been received', response.message)
+        self.tip._offset_received(offset_message('left_tip'))
+        with patch('task_priority_kinematic_control_rqt.tip_offset.time.monotonic',
+                   return_value=time.monotonic() + 5.0):
+            response = self.read(session)
+        self.assertFalse(response.success)
+        self.assertIn('stale', response.message)
+
+    def test_toggling_use_offset_rereads_the_pose_of_the_new_point(self):
+        session = self.session()
+        host = SimpleNamespace(sessions=[session])
+        self.tip._offset_received(offset_message('left_tip'))
+        self.assertTrue(self.read(session).success)
+        self.tip._use_received(SimpleNamespace(data=True))
+        self.assertEqual(self.changes, [self.tip])  # the node is notified once, on the change
+        PlanningMarkerNode.tip_changed(host, self.tip)
+        self.assertAlmostEqual(session.target.tool_poses[0].position.z, 0.2)
+        self.assertEqual(self.visual(session).name, 'frame')
+        self.tip._use_received(SimpleNamespace(data=True))
+        self.assertEqual(len(self.changes), 1)  # unchanged state: no new notification
+        self.tip._use_received(SimpleNamespace(data=False))
+        PlanningMarkerNode.tip_changed(host, self.tip)
+        self.assertAlmostEqual(session.target.tool_poses[0].position.z, 0.0)
+        self.assertEqual(self.visual(session).name, 'gripper')
+
+    def test_a_reserved_target_is_not_moved_when_use_offset_changes(self):
+        session = self.session()
+        self.tip._offset_received(offset_message('left_tip'))
+        session.target.locked = True
+        before = deepcopy(session.target.tool_poses)
+        self.tip._use_received(SimpleNamespace(data=True))
+        PlanningMarkerNode.tip_changed(SimpleNamespace(sessions=[session]), self.tip)
+        self.assertEqual(session.target.tool_poses, before)
 
 
 class NodeConstructionTest(unittest.TestCase):

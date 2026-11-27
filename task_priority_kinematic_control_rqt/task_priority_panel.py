@@ -406,12 +406,13 @@ class TaskPriorityPanel(Plugin):
             self._facing_left_axis_combo.addItem(name, name)
             self._facing_right_axis_combo.addItem(name, name)
         self._facing_left_axis_combo.setCurrentIndex(self._facing_left_axis_combo.findData("+z"))
-        self._facing_right_axis_combo.setCurrentIndex(self._facing_right_axis_combo.findData("+z"))
+        self._facing_right_axis_combo.setCurrentIndex(self._facing_right_axis_combo.findData("-z"))
         self._facing_roll_spin = QDoubleSpinBox()
         self._facing_roll_spin.setRange(-180.0, 180.0)
         self._facing_roll_spin.setDecimals(2)
         self._facing_roll_spin.setSingleStep(5.0)
         self._facing_roll_spin.setSuffix(" deg")
+        self._facing_roll_spin.setValue(180.0)
         self._facing_keep_roll_checkbox = QCheckBox("Keep current roll")
         self._facing_keep_roll_checkbox.toggled.connect(
             lambda checked: self._facing_roll_spin.setEnabled(not checked)
@@ -452,25 +453,6 @@ class TaskPriorityPanel(Plugin):
         layout.addRow(help_label)
         widget.setVisible(False)
         return widget
-
-    def _sync_facing_goal_fields(self, task_id):
-        state = self._latest_task_states.get(task_id)
-        if state is None or len(state.target) != 8:
-            return
-        target = list(state.target)
-        for combo, axis in (
-            (self._facing_left_axis_combo, target[0:3]),
-            (self._facing_right_axis_combo, target[3:6]),
-        ):
-            for name, values in FACING_AXES.items():
-                if all(abs(a - b) < 1e-3 for a, b in zip(axis, values)):
-                    combo.setCurrentIndex(combo.findData(name))
-                    break
-        if math.isfinite(target[6]):
-            self._facing_roll_spin.setValue(math.degrees(target[6]))
-        if math.isfinite(target[7]) and target[7] > 0.0:
-            # Clamped to the slider range (0.001-0.5 m) by the spin box.
-            self._facing_distance_spin.setValue(target[7])
 
     def _publish_facing_target(self, task_id):
         topic_name = f"{TASK_TOPIC_PREFIX}/{task_id}/facing_target"
@@ -1499,7 +1481,6 @@ class TaskPriorityPanel(Plugin):
             self._clear_layout(self._joint_target_layout)
             self._joint_target_controls = []
             self._live_joint_target_checkbox.setVisible(False)
-            self._sync_facing_goal_fields(task_id)
             self._goal_button.setEnabled(True)
             return
 

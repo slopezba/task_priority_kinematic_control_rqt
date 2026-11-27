@@ -10,7 +10,7 @@ from .marker_transport import MarkerTransport
 
 from .marker_geometry import (  # Re-export pose helpers used by the Cartesian form.
     pose_components, pose_from_components, pose_from_transform, transform_pose,
-    normalized_pose, relative_pose,
+    axis_name, axis_vector, normalized_pose,
 )
 
 
@@ -45,8 +45,8 @@ class PlanningMarkerEditor(QObject):
         form.addRow('Planning target service', self.endpoint)
         form.addRow('RViz target', self.status)
         if bimanual:
-            note = QLabel('Markers define relative separation/orientation only. Their absolute poses '
-                          'are illustrative; the base is fixed.')
+            note = QLabel('Markers define the facing distance and roll between both tools. Their '
+                          'absolute poses are illustrative; the base is fixed.')
             note.setWordWrap(True)
             form.addRow(note)
         tab._inputs.extend([self.show, self.namespace, self.endpoint])
@@ -70,14 +70,16 @@ class PlanningMarkerEditor(QObject):
         self.endpoint.editingFinished.connect(self._connect)
         self.namespace.editingFinished.connect(self.commit_fields)
         self.show.toggled.connect(self._visibility_changed)
-        for edit in (tab.xyz_edit, tab.quaternion_edit):
-            edit.editingFinished.connect(self.commit_fields)
         if bimanual:
-            for combo in (tab.arm_a_combo, tab.arm_b_combo):
-                combo.currentTextChanged.connect(self._schedule_selection)
-            for edit in (tab.arm_a_tip_edit, tab.arm_b_tip_edit, tab.reference_frame_edit):
+            for combo in (tab.left_axis_combo, tab.right_axis_combo):
+                combo.currentTextChanged.connect(lambda _text: self.commit_fields())
+            for edit in (tab.roll_edit, tab.distance_spin):
+                edit.editingFinished.connect(self.commit_fields)
+            for edit in (tab.left_tip_edit, tab.right_tip_edit, tab.reference_frame_edit):
                 edit.editingFinished.connect(self._selection_changed)
         else:
+            for edit in (tab.xyz_edit, tab.quaternion_edit):
+                edit.editingFinished.connect(self.commit_fields)
             tab.arm_combo.currentTextChanged.connect(self._schedule_selection)
             tab.tool_frame_edit.editingFinished.connect(self._selection_changed)
         self.timer = QTimer(self)
@@ -116,7 +118,11 @@ class PlanningMarkerEditor(QObject):
             self._on_state(state)
 
     def _field_text(self):
-        return self.tab.xyz_edit.text(), self.tab.quaternion_edit.text()
+        tab = self.tab
+        if self.bimanual:
+            return (tab.left_axis_combo.currentText(), tab.right_axis_combo.currentText(),
+                    tab.roll_edit.text(), tab.distance_spin.value())
+        return tab.xyz_edit.text(), tab.quaternion_edit.text()
 
     def _field_pose(self):
         p, q = ([float(v.strip()) for v in text.split(',')] for text in self._field_text())
@@ -125,8 +131,8 @@ class PlanningMarkerEditor(QObject):
     def _selection(self):
         tab = self.tab
         if self.bimanual:
-            return ((tab.arm_a_combo.currentText().strip(), tab.arm_a_tip_edit.text().strip()),
-                    (tab.arm_b_combo.currentText().strip(), tab.arm_b_tip_edit.text().strip()))
+            return ((tab.arm_names[0], tab.left_tip_edit.text().strip()),
+                    (tab.arm_names[1], tab.right_tip_edit.text().strip()))
         return ((tab.arm_combo.currentText().strip(), tab.tool_frame_edit.text().strip()),)
 
     def _write_fields(self, pose):
@@ -134,6 +140,15 @@ class PlanningMarkerEditor(QObject):
             previous = edit.blockSignals(True)
             edit.setText(','.join(f'{v:.12g}' for v in values))
             edit.blockSignals(previous)
+        self._last_fields = self._field_text()
+
+    def _write_target(self, state):
+        if not self.bimanual:
+            self._write_fields(state.target_pose.pose)
+            return
+        axes = [axis_name([v.x, v.y, v.z])
+                for v in (state.left_pointing_axis, state.right_pointing_axis)]
+        self.tab.set_facing_fields(*axes, state.roll_angle, state.distance)
         self._last_fields = self._field_text()
 
     def _apply_state(self, state):
@@ -144,10 +159,9 @@ class PlanningMarkerEditor(QObject):
             self.selection = tuple(zip(state.arm_names, state.tool_frames))
             widgets = [(self.namespace, state.marker_namespace), (self.tab.reference_frame_edit, state.frame_id)]
             if self.bimanual:
-                widgets += [(self.tab.arm_a_combo, state.arm_names[0]),
-                            (self.tab.arm_b_combo, state.arm_names[1]),
-                            (self.tab.arm_a_tip_edit, state.tool_frames[0]),
-                            (self.tab.arm_b_tip_edit, state.tool_frames[1])]
+                self.tab.arm_names = list(state.arm_names)
+                widgets += [(self.tab.left_tip_edit, state.tool_frames[0]),
+                            (self.tab.right_tip_edit, state.tool_frames[1])]
             else:
                 widgets += [(self.tab.arm_combo, state.arm_names[0]),
                             (self.tab.tool_frame_edit, state.tool_frames[0])]
@@ -164,7 +178,7 @@ class PlanningMarkerEditor(QObject):
             self.show.setChecked(state.visible)
             self.show.blockSignals(previous)
             if state.tool_poses:
-                self._write_fields(state.target_pose.pose)
+                self._write_target(state)
             if old_arm is not None and old_arm != state.arm_names[0]:
                 self.tab._refresh_joint_catalog()
             self.status.setText(state.status)
@@ -202,7 +216,13 @@ class PlanningMarkerEditor(QObject):
         state.arm_names = [arm for arm, _ in self._selection()]
         state.tool_frames = [tool for _, tool in self._selection()]
         state.target_pose.header.frame_id = state.frame_id
-        state.target_pose.pose = self._field_pose()
+        if self.bimanual:
+            left, right, roll, distance = self.tab.facing_fields()
+            for vector, name in ((state.left_pointing_axis, left), (state.right_pointing_axis, right)):
+                vector.x, vector.y, vector.z = axis_vector(name)
+            state.roll_angle, state.distance = roll, distance
+        else:
+            state.target_pose.pose = self._field_pose()
         state.tool_poses = deepcopy(self.confirmed.tool_poses) if self.confirmed is not None else deepcopy(self.poses)
         state.visible = self.show.isChecked()
         state.action_name = self.tab.action_edit.text().strip()
@@ -265,7 +285,8 @@ class PlanningMarkerEditor(QObject):
     def set_poses(self, poses, frame):
         # Used by the legacy manual TF read when markers are disabled.
         self.poses, self.frame, self.selection = [normalized_pose(p) for p in poses], frame, self._selection()
-        self._write_fields(relative_pose(*self.poses) if self.bimanual else self.poses[0])
+        if not self.bimanual:
+            self._write_fields(self.poses[0])
         self.commit_fields()
 
     def read_pose(self):
@@ -316,8 +337,9 @@ class PlanningMarkerEditor(QObject):
             draft = self._draft()
             def locked(state):
                 if self.bimanual:
-                    goal.arm_a, goal.arm_b = state.arm_names
-                    goal.relative_target = deepcopy(state.target_pose)
+                    goal.left_pointing_axis = deepcopy(state.left_pointing_axis)
+                    goal.right_pointing_axis = deepcopy(state.right_pointing_axis)
+                    goal.roll_angle, goal.distance = state.roll_angle, state.distance
                 else:
                     goal.arm = state.arm_names[0]
                     goal.target_pose = deepcopy(state.target_pose)

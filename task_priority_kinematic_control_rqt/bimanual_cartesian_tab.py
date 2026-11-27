@@ -1,4 +1,4 @@
-"""Manual client for the bimanual Cartesian planner, sharing the panel's ROS node."""
+"""Manual client for the bimanual end-effectors facing planner, sharing the panel's ROS node."""
 
 import math
 import os
@@ -17,6 +17,7 @@ from std_srvs.srv import Trigger
 from sura_manipulation_actions.action import PlanBimanualCartesianTrajectory
 from tf2_ros import Buffer, TransformException, TransformListener
 
+from .marker_geometry import AXIS_NAMES, axis_vector, facing_measure
 from .planning_markers import PlanningMarkerEditor, pose_from_transform
 
 
@@ -85,28 +86,18 @@ def relative_reference_frame():
     return configured_reference_frame()
 
 
-def relative_pose_components(arm_a, arm_b):
-    """Both TF transforms share reference axes: dp=pB-pA, dq=qB*conjugate(qA)."""
-    position = [getattr(arm_b.translation, axis) - getattr(arm_a.translation, axis)
-                for axis in ("x", "y", "z")]
-    quaternions = []
-    for transform in (arm_a, arm_b):
-        values = [getattr(transform.rotation, axis) for axis in ("x", "y", "z", "w")]
-        norm = math.hypot(*values)
-        if not math.isfinite(norm) or norm < 1e-12:
-            raise ValueError("TF orientation must have a finite, nonzero norm")
-        quaternions.append([value / norm for value in values])
-    lx, ly, lz, lw = quaternions[0]
-    fx, fy, fz, fw = quaternions[1]
-    quaternion = [fx * lw - fw * lx - fy * lz + fz * ly,
-                  fy * lw - fw * ly - fz * lx + fx * lz,
-                  fz * lw - fw * lz - fx * ly + fy * lx,
-                  fw * lw + fx * lx + fy * ly + fz * lz]
-    if quaternion[3] < 0.0:
-        quaternion = [-value for value in quaternion]
-    if not all(math.isfinite(value) for value in position):
-        raise ValueError("TF position must be finite")
-    return position, quaternion
+def roll_value(text):
+    """Empty or 'nan' keeps the measured roll."""
+    text = text.strip()
+    if not text or text.lower() == "nan":
+        return float("nan")
+    try:
+        value = float(text)
+    except ValueError as error:
+        raise ValueError("Roll must be a number, or empty to keep the measured roll") from error
+    if not math.isfinite(value):
+        raise ValueError("Roll must be finite, or empty to keep the measured roll")
+    return value
 
 
 class BimanualCartesianTab(QWidget):
@@ -142,11 +133,10 @@ class BimanualCartesianTab(QWidget):
         self.form_scroll.setWidget(content)
         layout.addWidget(self.form_scroll, 1)
         note = QLabel(
-            "Relative target: B minus A position, and B/A "
-            "rotation difference, expressed in reference (base) axes. "
-            "Positions are metres; angular constraints are radians. "
-            "Zero relative tolerances remain strict; zero speed factors use server defaults. "
-            "Joint movement weights are configured with planning.weights in the planner YAML. "
+            "End-effectors facing: each tool axis points at the other tool, with the requested "
+            "relative roll around the line between them and distance. Only the arm joints move. "
+            "Angles are radians; zero tolerances remain strict; zero speed factors use server "
+            "defaults. Left/right arms and planning.weights are configured in the planner YAML. "
             "Backend activation is manual."
         )
         note.setWordWrap(True)
@@ -161,33 +151,30 @@ class BimanualCartesianTab(QWidget):
             edit.setCursorPosition(0)
             edit.setToolTip(edit.text())
             edit.textChanged.connect(edit.setToolTip)
-        self.arm_a_combo = QComboBox()
-        self.arm_b_combo = QComboBox()
-        self._arm_frames = arm_frames()
-        for combo in (self.arm_a_combo, self.arm_b_combo):
-            combo.setEditable(True)
-            combo.addItems(list(self._arm_frames))
-        if self.arm_b_combo.count() > 1:
-            self.arm_b_combo.setCurrentIndex(1)
-        self.arm_a_tip_edit = QLineEdit(self._arm_frames[self.arm_a_combo.currentText()])
-        self.arm_b_tip_edit = QLineEdit(self._arm_frames[self.arm_b_combo.currentText()])
+        frames = arm_frames()
+        names = list(frames)[:2] if len(frames) > 1 else ["alpha_left", "alpha_right"]
+        self.arm_names = names
+        self.left_tip_edit = QLineEdit(frames.get(names[0], ""))
+        self.right_tip_edit = QLineEdit(frames.get(names[1], ""))
         self.reference_frame_edit = QLineEdit(relative_reference_frame())
-        self.reference_frame_edit.setToolTip("Must match relative_reference_frame configured in the planner")
-        self.arm_a_tip_edit.setToolTip("TF tool link; must match arm A tip configured in the planner")
-        self.arm_b_tip_edit.setToolTip("TF tool link; must match arm B tip configured in the planner")
-        self.arm_a_combo.currentTextChanged.connect(
-            lambda name: self.arm_a_tip_edit.setText(self._arm_frames.get(name.strip(), "")))
-        self.arm_b_combo.currentTextChanged.connect(
-            lambda name: self.arm_b_tip_edit.setText(self._arm_frames.get(name.strip(), "")))
-
-        self.xyz_edit = QLineEdit("0.0,0.0,0.0")
-        self.xyz_edit.setToolTip("Comma-separated B-minus-A X,Y,Z in reference axes, in metres")
-        self.quaternion_edit = QLineEdit("0.0,0.0,0.0,1.0")
-        self.quaternion_edit.setToolTip("Relative rotation R_arm_b * R_arm_a^T in reference axes; quaternion XYZW")
-        self.read_pose_button = QPushButton("Read Relative Pose (TF)")
+        self.reference_frame_edit.setToolTip("Frame used to read both tools and draw the RViz target")
+        self.left_tip_edit.setToolTip("TF tool link; must match the left tip configured in the planner")
+        self.right_tip_edit.setToolTip("TF tool link; must match the right tip configured in the planner")
+        self.left_axis_combo, self.right_axis_combo = QComboBox(), QComboBox()
+        for combo, side in ((self.left_axis_combo, "left"), (self.right_axis_combo, "right")):
+            combo.addItems(list(AXIS_NAMES))
+            combo.setCurrentText("+z" if side == "left" else "-z")
+            combo.setToolTip(f"Axis of the {side} tool, in its own frame, that points at the other tool")
+        self.roll_edit = QLineEdit(f"{math.pi:.12g}")  # 180 degrees
+        self.roll_edit.setPlaceholderText("keep measured roll")
+        self.roll_edit.setToolTip("Relative roll around the left->right line [rad]; empty keeps the measured one")
+        self.distance_spin = self._spin(0.3, 100.0, 0.01)
+        self.distance_spin.setToolTip("Distance between both tools [m]")
+        self.read_pose_button = QPushButton("Read Current Facing (TF)")
         self.read_pose_button.clicked.connect(self._read_pose)
-        self.position_tolerances, position_row = self._vector_row(0.002, 100.0)
-        self.orientation_tolerances, orientation_row = self._vector_row(0.03, math.pi)
+        self.pointing_tolerance_spin = self._spin(0.05, math.pi, 0.01)
+        self.roll_tolerance_spin = self._spin(0.05, math.pi, 0.01)
+        self.distance_tolerance_spin = self._spin(0.005, 100.0, 0.001)
         self.step_spin = self._spin(0.005, 1.0, 0.001)
         self.step_spin.setToolTip("Metres. Zero selects the planner's configured default")
         self.planning_time_spin = self._spin(10.0, 3600.0, 1.0)
@@ -199,38 +186,59 @@ class BimanualCartesianTab(QWidget):
             spin.setDecimals(3)
             spin.setSpecialValueText("Server default")
             spin.setToolTip("Joint limit factor: 0.1 = 10%, 0.05 = 5%. Zero uses the server default")
+        self.velocity_scaling_spin.setValue(0.1)
+        self.acceleration_scaling_spin.setValue(0.05)
+        # The minimum is the "server default" entry; every value from 0 on is sent as is.
+        self.orientation_fraction_spin = QDoubleSpinBox()
+        self.orientation_fraction_spin.setDecimals(2)
+        self.orientation_fraction_spin.setRange(-0.05, 0.99)
+        self.orientation_fraction_spin.setSingleStep(0.05)
+        self.orientation_fraction_spin.setSpecialValueText("Server default")
+        self.orientation_fraction_spin.setValue(0.4)
+        self.orientation_fraction_spin.setToolTip(
+            "Share of the trajectory used to correct the pointing axes and the roll before the "
+            "distance changes: 0.4 = the first 40%. Zero changes everything simultaneously")
         self.backend_combo = QComboBox()
         for label, value in (("Server default", ""), ("Controller", "controller"),
-                             ("Task", "task"), ("Pose", "pose")):
+                             ("Task", "task"), ("Facing", "facing")):
             self.backend_combo.addItem(label, value)
         self.backend_combo.setToolTip(
-            "Pose streams STPIK-validated poses to the left_pose / right_pose tasks; "
-            "Server default uses the planner's execution_backend parameter")
+            "Facing streams the facing reference to EndEffectors_Facing and the arm joints "
+            "to robot_nominal (base masked); Server default uses the planner's execution_backend parameter")
+        self.backend_combo.setCurrentIndex(self.backend_combo.findData("facing"))
         self.execute_checkbox = QCheckBox("Execute after planning")
         self.execute_checkbox.setChecked(False)
+        self.optimize_checkbox = QCheckBox("Optimize whole trajectory (robot_nominal)")
+        self.optimize_checkbox.setToolTip(
+            "Plan the whole facing trajectory with the controller's Task Priority hierarchy "
+            "(the same global planner as the single-arm mode). Requires the Facing backend; "
+            "tracking tolerances come from the planner's execution.facing_* parameters.")
         self.stpik_checkbox = QCheckBox("Use STPIK")
         self.stpik_checkbox.setChecked(True)
         self.stpik_checkbox.setToolTip(
-            "Pose execution: validate both arms with STPIK before streaming poses. "
+            "Facing execution: simulate the facing hierarchy with STPIK before streaming. "
             "Unchecked skips offline validation; execution still monitors tracking.")
         self.backend_combo.currentIndexChanged.connect(lambda _index: self._update_controls())
 
         form.addRow("Action", self.action_edit)
         form.addRow("Execute Pending Service", self.execute_service_edit)
-        form.addRow("Arm A", self.arm_a_combo)
-        form.addRow("Arm B", self.arm_b_combo)
-        form.addRow("Relative Reference Frame", self.reference_frame_edit)
-        form.addRow("Arm A Tool Frame", self.arm_a_tip_edit)
-        form.addRow("Arm B Tool Frame (TF)", self.arm_b_tip_edit)
-        form.addRow("Relative XYZ [m]", self.xyz_edit)
-        form.addRow("Relative Quaternion XYZW", self.quaternion_edit)
-        form.addRow("Relative Position Tolerances [m]", position_row)
-        form.addRow("Relative Orientation Tolerances [rad]", orientation_row)
+        form.addRow("Left Tool Frame (TF)", self.left_tip_edit)
+        form.addRow("Right Tool Frame (TF)", self.right_tip_edit)
+        form.addRow("Reference Frame", self.reference_frame_edit)
+        form.addRow("Left Pointing Axis", self.left_axis_combo)
+        form.addRow("Right Pointing Axis", self.right_axis_combo)
+        form.addRow("Roll [rad]", self.roll_edit)
+        form.addRow("Distance [m]", self.distance_spin)
+        form.addRow("Pointing Tolerance [rad]", self.pointing_tolerance_spin)
+        form.addRow("Roll Tolerance [rad]", self.roll_tolerance_spin)
+        form.addRow("Distance Tolerance [m]", self.distance_tolerance_spin)
+        form.addRow("Orientation Phase [0..1)", self.orientation_fraction_spin)
         form.addRow("Cartesian Step [m]", self.step_spin)
         form.addRow("Planning Time [s]", self.planning_time_spin)
         form.addRow("Velocity Scaling [0..1]", self.velocity_scaling_spin)
         form.addRow("Acceleration Scaling [0..1]", self.acceleration_scaling_spin)
         form.addRow("Execution Backend", self.backend_combo)
+        form.addRow(self.optimize_checkbox)
         form.addRow(self.stpik_checkbox)
         form.addRow(self.execute_checkbox)
 
@@ -249,7 +257,7 @@ class BimanualCartesianTab(QWidget):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.feedback_label = QLabel("Read the current pose or enter a relative target, then send a goal")
+        self.feedback_label = QLabel("Read the current facing or enter a target, then send a goal")
         self.result_label = QLabel("")
         self.feedback_label.setWordWrap(True)
         self.result_label.setWordWrap(True)
@@ -259,13 +267,13 @@ class BimanualCartesianTab(QWidget):
         self._configure_diagnostic_copy(footer)
         layout.addLayout(footer)
         self._inputs = [
-            self.action_edit, self.execute_service_edit, self.arm_a_combo, self.arm_b_combo,
-            self.arm_a_tip_edit, self.arm_b_tip_edit, self.xyz_edit, self.quaternion_edit,
-            self.reference_frame_edit,
-            self.read_pose_button, self.step_spin, self.planning_time_spin,
-            self.velocity_scaling_spin, self.acceleration_scaling_spin,
-            self.backend_combo, self.execute_checkbox, *self.position_tolerances,
-            *self.orientation_tolerances,
+            self.action_edit, self.execute_service_edit, self.left_tip_edit, self.right_tip_edit,
+            self.reference_frame_edit, self.left_axis_combo, self.right_axis_combo, self.roll_edit,
+            self.distance_spin, self.pointing_tolerance_spin, self.roll_tolerance_spin,
+            self.distance_tolerance_spin, self.read_pose_button, self.step_spin,
+            self.planning_time_spin, self.velocity_scaling_spin, self.acceleration_scaling_spin,
+            self.backend_combo, self.execute_checkbox, self.optimize_checkbox,
+            self.orientation_fraction_spin,
         ]
         self._markers = PlanningMarkerEditor(self, form, bimanual=True)
         self._update_controls()
@@ -325,7 +333,7 @@ class BimanualCartesianTab(QWidget):
             widget.setEnabled(editable)
         self.send_button.setEnabled(editable)
         if hasattr(self, "stpik_checkbox"):
-            self.stpik_checkbox.setEnabled(editable and self.backend_combo.currentData() in ("", "pose"))
+            self.stpik_checkbox.setEnabled(editable and self.backend_combo.currentData() in ("", "facing"))
         self.execute_button.setEnabled(
             self._waiting and self._goal_handle is not None and
             self._execute_future is None and not self._cancel_requested and not self._closed)
@@ -337,56 +345,56 @@ class BimanualCartesianTab(QWidget):
         if not self._closed:
             self.result_label.setText(f"Error: {message}")
 
+    def facing_fields(self):
+        return (self.left_axis_combo.currentText(), self.right_axis_combo.currentText(),
+                roll_value(self.roll_edit.text()), self.distance_spin.value())
+
+    def set_facing_fields(self, left, right, roll, distance):
+        widgets = (self.left_axis_combo, self.right_axis_combo, self.roll_edit, self.distance_spin)
+        blocked = [widget.blockSignals(True) for widget in widgets]
+        self.left_axis_combo.setCurrentText(left)
+        self.right_axis_combo.setCurrentText(right)
+        self.roll_edit.setText(f"{roll:.12g}" if math.isfinite(roll) else "")
+        self.distance_spin.setValue(distance)
+        for widget, previous in zip(widgets, blocked):
+            widget.blockSignals(previous)
+
     def _read_pose(self):
         if self._markers.read_pose():
             return
         reference = self.reference_frame_edit.text().strip()
-        arm_a = self.arm_a_tip_edit.text().strip()
-        arm_b = self.arm_b_tip_edit.text().strip()
-        if not reference or not arm_a or not arm_b or arm_a == arm_b or reference in (arm_a, arm_b):
-            self._error("Enter a reference frame and distinct arm A/B tool frames")
+        left = self.left_tip_edit.text().strip()
+        right = self.right_tip_edit.text().strip()
+        if not reference or not left or not right or left == right:
+            self._error("Enter a reference frame and distinct left/right tool frames")
             return
         try:
-            arm_a_tf = self._tf_buffer.lookup_transform(reference, arm_a, Time())
-            arm_b_tf = self._tf_buffer.lookup_transform(
-                reference, arm_b, Time.from_msg(arm_a_tf.header.stamp))
-            position, quaternion = relative_pose_components(arm_a_tf.transform, arm_b_tf.transform)
+            left_tf = self._tf_buffer.lookup_transform(reference, left, Time())
+            right_tf = self._tf_buffer.lookup_transform(
+                reference, right, Time.from_msg(left_tf.header.stamp))
+            poses = [pose_from_transform(left_tf.transform), pose_from_transform(right_tf.transform)]
+            axes = (self.left_axis_combo.currentText(), self.right_axis_combo.currentText())
+            distance, roll = facing_measure(*poses, *axes)
         except (TransformException, ValueError) as error:
-            self._error(f"Relative TF is unavailable: {error}")
+            self._error(f"Facing TF is unavailable: {error}")
             return
-        self.xyz_edit.setText(",".join(f"{value:.12g}" for value in position))
-        self.quaternion_edit.setText(",".join(f"{value:.12g}" for value in quaternion))
-        self._markers.set_poses([pose_from_transform(arm_a_tf.transform),
-                                pose_from_transform(arm_b_tf.transform)], reference)
-        self.result_label.setText(f"Current relative pose read in {reference}; edit XYZ to set an offset")
+        self.set_facing_fields(*axes, float("nan") if roll is None else roll, distance)
+        self._markers.set_poses(poses, reference)
+        self.result_label.setText("Current distance and roll read; edit them to set the target")
 
     def _goal_from_fields(self):
-        arm_a = self.arm_a_combo.currentText().strip()
-        arm_b = self.arm_b_combo.currentText().strip()
-        frame = self.reference_frame_edit.text().strip()
-        if not arm_a or not arm_b or arm_a == arm_b:
-            raise ValueError("Arm A and arm B must be distinct configured arm names")
-        if not frame:
-            raise ValueError("Enter the configured relative reference frame")
-        xyz = numeric_vector(self.xyz_edit.text(), 3, "Relative XYZ")
-        quaternion = numeric_vector(self.quaternion_edit.text(), 4, "Quaternion XYZW")
-        norm = math.hypot(*quaternion)
-        if norm < 1e-12 or not math.isfinite(norm):
-            raise ValueError("Quaternion must have a finite, nonzero norm")
+        left, right, roll, distance = self.facing_fields()
+        if distance <= 0.0:
+            raise ValueError("Distance must be positive")
         goal = PlanBimanualCartesianTrajectory.Goal()
-        goal.arm_a, goal.arm_b = arm_a, arm_b
-        goal.relative_target.header.frame_id = frame
-        goal.relative_target.header.stamp = self._node.get_clock().now().to_msg()
-        for axis, value in zip(("x", "y", "z"), xyz):
-            setattr(goal.relative_target.pose.position, axis, value)
-        for axis, value in zip(("x", "y", "z", "w"), quaternion):
-            setattr(goal.relative_target.pose.orientation, axis, value / norm)
-        for vector, spins in (
-            (goal.relative_position_tolerance, self.position_tolerances),
-            (goal.relative_orientation_tolerance, self.orientation_tolerances),
-        ):
-            for axis, spin in zip(("x", "y", "z"), spins):
-                setattr(vector, axis, spin.value())
+        for vector, name in ((goal.left_pointing_axis, left), (goal.right_pointing_axis, right)):
+            vector.x, vector.y, vector.z = axis_vector(name)
+        goal.roll_angle, goal.distance = roll, distance
+        goal.pointing_tolerance = self.pointing_tolerance_spin.value()
+        goal.roll_tolerance = self.roll_tolerance_spin.value()
+        goal.distance_tolerance = self.distance_tolerance_spin.value()
+        fraction = self.orientation_fraction_spin.value()
+        goal.facing_orientation_fraction = fraction if fraction >= 0.0 else -1.0
         goal.cartesian_step = self.step_spin.value()
         goal.planning_time = self.planning_time_spin.value()
         goal.velocity_scaling = self.velocity_scaling_spin.value()
@@ -394,6 +402,9 @@ class BimanualCartesianTab(QWidget):
         goal.execution_backend = self.backend_combo.currentData() or ""
         goal.use_stpik = self.stpik_checkbox.isChecked()
         goal.execute = self.execute_checkbox.isChecked()
+        goal.optimize_trajectory_nominal = self.optimize_checkbox.isChecked()
+        if goal.optimize_trajectory_nominal and goal.execution_backend not in ("", "facing"):
+            raise ValueError("Optimize whole trajectory requires the Facing backend")
         return goal
 
     def _send_goal(self):
